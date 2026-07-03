@@ -193,6 +193,7 @@ class WheelPreviewWindow(tk.Toplevel):
         self._view      = tk.StringVar(value='f')
         self._drag      = None
         self._tk_img    = None
+        self._tk_bg     = None
         self._tk_ovls   = []           # keep PhotoImage refs alive
         self._cids      = {}
         self._body_off  = {}           # view -> (xmin, ymin) from body SWF RECT
@@ -211,25 +212,11 @@ class WheelPreviewWindow(tk.Toplevel):
         }
         self._ov_status  = tk.StringVar(value='Click "Load" to show tire/wheel images')
 
-        self._init_body_offsets()
         self._build_ui()
         self._render()
         self.grab_set()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
-
-    def _init_body_offsets(self):
-        """Read each view's body SWF RECT so we know where the image starts in stage."""
-        from swf_utils import swf_rect_origin
-        for view in ('f', 'b'):
-            info = self._pkg_info.get(self._car_id, {})
-            xmin, ymin, w, h = 0.0, 0.0, float(self.STAGE_W), float(self.STAGE_H)
-            if view in info:
-                body_path = os.path.join(info[view], 'body.swf')
-                if os.path.exists(body_path):
-                    xmin, ymin, w, h = swf_rect_origin(body_path)
-            self._body_off[view]  = (xmin, ymin)
-            self._body_size[view] = (w, h)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -296,51 +283,59 @@ class WheelPreviewWindow(tk.Toplevel):
         self._cv.bind('<shift-Down>',  lambda e: self._nudge(  0,  10))
         self._cv.config(takefocus=True)
 
-        # Position + size table (right of canvas)
+        # Position + size table (right of canvas) — all 5 wheel positions, both views
         right = tk.Frame(mid, bg=BG)
         right.grid(row=0, column=1, sticky='ns', padx=(10, 0))
 
         pos_lf = ttk.LabelFrame(right, text="Wheel Positions & Size", padding=(8, 4))
         pos_lf.pack(fill='x')
-        for col, hdr in enumerate(['', '', '', 'X', 'Y', 'W%', 'H%'], start=0):
-            ttk.Label(pos_lf, text=hdr, foreground='#888',
-                      font=('Segoe UI', 7)).grid(row=0, column=col, padx=(2, 2))
 
-        self._pos_spins = {}
-        self._pos_chks  = {}
-        self._sz_spins  = {}
-        for row_i, (tire, label) in enumerate([('F', 'Front'), ('R', 'Rear'),
-                                               ('Back', 'Race-rear')], start=1):
-            ck = ttk.Checkbutton(pos_lf, variable=self._show_pos[tire], command=self._render)
-            ck.grid(row=row_i, column=0, padx=(0, 2))
+        # Visibility toggles
+        vis_fr = ttk.Frame(pos_lf)
+        vis_fr.grid(row=0, column=0, columnspan=6, sticky='w', pady=(0, 4))
+        ttk.Label(vis_fr, text='Show:', foreground='#888',
+                  font=('Segoe UI', 7)).pack(side='left', padx=(0, 4))
+        self._pos_chks = {}
+        for tire, label in [('F', 'Front'), ('R', 'Rear'), ('Back', 'Race-rear')]:
+            ck = ttk.Checkbutton(vis_fr, text=label,
+                                 variable=self._show_pos[tire], command=self._render)
+            ck.pack(side='left', padx=(0, 6))
             self._pos_chks[tire] = ck
-            tk.Label(pos_lf, text='●', fg=self.TIRE_COLORS[tire],
-                     bg=BG, font=('Segoe UI', 9)).grid(row=row_i, column=1, sticky='w')
-            ttk.Label(pos_lf, text=label).grid(row=row_i, column=2, sticky='w', padx=(2, 6))
-            for col_i, vname in enumerate(['tx', 'ty', 'scx', 'scy'], start=3):
-                sp = tk.Spinbox(pos_lf,
-                                from_=-9999 if vname in ('tx', 'ty') else 1,
-                                to=9999 if vname in ('tx', 'ty') else 500,
-                                increment=1, width=5,
-                                bg="#16213e", fg=ACC, buttonbackground="#0f3460",
-                                relief="flat", font=("Consolas", 8))
-                sp.grid(row=row_i, column=col_i, padx=(2, 2))
-                self._pos_spins[(tire, vname)] = sp
-                if vname in ('scx', 'scy'):
-                    self._sz_spins[(tire, vname)] = sp
 
-        self._bind_all_pos_spins()
-        self._pos_chks['Back'].configure(state='disabled')
+        # Column headers
+        for col, hdr in enumerate(['', 'X', 'Y', 'W%', 'H%'], start=1):
+            ttk.Label(pos_lf, text=hdr, foreground='#888',
+                      font=('Segoe UI', 7)).grid(row=1, column=col, padx=(2, 2))
 
-        # Legend
-        leg = ttk.Frame(right)
-        leg.pack(fill='x', pady=(10, 0))
-        for lr, color in [('Front', self.TIRE_COLORS['F']),
-                          ('Rear',  self.TIRE_COLORS['R']),
-                          ('Race-rear', self.TIRE_COLORS['Back'])]:
-            tk.Label(leg, text='●', fg=color, bg=BG,
-                     font=('Segoe UI', 10)).pack(side='left')
-            ttk.Label(leg, text=f' {lr}  ').pack(side='left')
+        def _spin(parent, dv, lo, hi):
+            sp = tk.Spinbox(parent, textvariable=dv, from_=lo, to=hi, increment=1,
+                            width=5, bg="#16213e", fg=ACC, buttonbackground="#0f3460",
+                            relief="flat", font=("Consolas", 8))
+            dv.trace_add('write', lambda *_: self.after(0, self._render))
+            return sp
+
+        def _wheel_rows(start_row, view):
+            vu = view.upper()
+            ttk.Label(pos_lf, text=f'— {vu} View —', foreground='#555',
+                      font=('Segoe UI', 7)).grid(
+                row=start_row, column=0, columnspan=6, sticky='w', pady=(4, 1))
+            tires = [('F', 'Front'), ('R', 'Rear')] + ([('Back', 'Race-rear')] if view == 'b' else [])
+            for i, (tire, lbl) in enumerate(tires):
+                r = start_row + 1 + i
+                tk.Label(pos_lf, text='●', fg=self.TIRE_COLORS[tire],
+                         bg=BG, font=('Segoe UI', 9)).grid(row=r, column=0, sticky='w')
+                ttk.Label(pos_lf, text=lbl, font=('Segoe UI', 8),
+                          width=7).grid(row=r, column=1, sticky='w', padx=(0, 4))
+                wkey = (view, tire)
+                vars_ = self._wvars.get(wkey, {vn: tk.DoubleVar(value=100 if vn in ('scx','scy') else 0)
+                                               for vn in ('tx','ty','scx','scy')})
+                _spin(pos_lf, vars_['tx'],   -9999, 9999).grid(row=r, column=2, padx=2)
+                _spin(pos_lf, vars_['ty'],   -9999, 9999).grid(row=r, column=3, padx=2)
+                _spin(pos_lf, vars_['scx'],      1,  500).grid(row=r, column=4, padx=2)
+                _spin(pos_lf, vars_['scy'],      1,  500).grid(row=r, column=5, padx=2)
+
+        _wheel_rows(2, 'f')   # rows 3-4: Front view F, R
+        _wheel_rows(5, 'b')   # rows 6-9: Back view F, R, Back
 
         # ── ROW 2: coord readout + Close ─────────────────────────────────────
         foot = ttk.Frame(self, padding=(8, 0, 8, 8))
@@ -351,35 +346,6 @@ class WheelPreviewWindow(tk.Toplevel):
             foreground='#555', font=('Segoe UI', 8))
         self._coord_lbl.pack(side='left')
         ttk.Button(foot, text='Close', command=self.destroy).pack(side='right')
-
-    def _bind_all_pos_spins(self):
-        """Bind all position/size spinboxes to the current view's DoubleVars."""
-        view  = self._view.get()
-        all_v = ('tx', 'ty', 'scx', 'scy')
-        for tire in ('F', 'R', 'Back'):
-            wkey = (view, tire)
-            enabled = wkey in self._wvars
-            for vn in all_v:
-                sp = self._pos_spins.get((tire, vn))
-                if sp is None:
-                    continue
-                if not enabled:
-                    fallback = tk.DoubleVar(value=100 if vn in ('scx', 'scy') else 0)
-                    sp.configure(state='disabled', textvariable=fallback)
-                    continue
-                dv = self._wvars[wkey][vn]
-                sp.configure(state='normal', textvariable=dv)
-                # Remove any existing render traces then re-add once
-                for info in dv.trace_info():
-                    try:
-                        dv.trace_remove(info[0], info[1])
-                    except Exception:
-                        pass
-                dv.trace_add('write', lambda *_, dv=dv: self.after(0, self._render))
-
-    def _bind_sz_spins(self):
-        """Legacy shim — delegate to _bind_all_pos_spins."""
-        self._bind_all_pos_spins()
 
     # ── Overlay loading ────────────────────────────────────────────────────────
 
@@ -453,40 +419,63 @@ class WheelPreviewWindow(tk.Toplevel):
     # ── Rendering ─────────────────────────────────────────────────────────────
 
     # SWFs that carry position data, not visuals — skip when compositing
-    _SKIP_LABELS = {'tireF', 'tireR', 'wheelMaskAddF', 'wheelMaskAddR', 'decalLoader'}
+    _SKIP_LABELS  = {'tireF', 'tireR', 'wheelMaskAddF', 'wheelMaskAddR', 'decalLoader'}
+    # Layer names that sit behind tires (shadow, undercarriage)
+    _BG_LAYER_NAMES = ('shadow', 'undercarriage')
+    # Correct front-to-back draw order for foreground layers
+    _FG_ORDER = ['undercarriage', 'bumperrear', 'bumper', 'body',
+                 'line', 'hood', 'roofeffect', 'roof', 'spoiler']
 
-    def _get_composite_image(self):
-        """Composite all visual parts for the current view into one STAGE_W×STAGE_H image."""
+    def _get_split_composite(self):
+        """Return (bg_img, fg_img) composited at STAGE_W×STAGE_H.
+        bg = shadow/undercarriage (draws behind tires).
+        fg = everything else (draws in front of tires)."""
         view     = self._view.get()
         view_tag = f"[{view.upper()}]"
-        canvas   = Image.new('RGBA', (self.STAGE_W, self.STAGE_H), (0, 0, 0, 0))
-        found    = False
-        for slot in self._slots:
-            if view_tag not in slot.label:
-                continue
-            if any(s in slot.label for s in self._SKIP_LABELS):
-                continue
+        size     = (self.STAGE_W, self.STAGE_H)
+        bg = Image.new('RGBA', size, (0, 0, 0, 0))
+        fg = Image.new('RGBA', size, (0, 0, 0, 0))
+        found = False
+
+        # One representative slot per SWF (first encountered)
+        seen: dict[str, object] = {}
+        for s in self._slots:
+            if view_tag in s.label and s.swf_path not in seen:
+                if not any(sk in s.label for sk in self._SKIP_LABELS):
+                    seen[s.swf_path] = s
+
+        def _layer_key(swf_path):
+            name = os.path.basename(swf_path).lower().replace('.swf', '')
+            for i, k in enumerate(self._FG_ORDER):
+                if k in name:
+                    return i
+            return 4
+
+        for swf_path, slot in sorted(seen.items(), key=lambda kv: _layer_key(kv[0])):
             try:
                 img = slot.final_image()
                 ox = oy = 0
-                if os.path.exists(slot.swf_path):
-                    xmin, ymin, w, h = swf_rect_origin(slot.swf_path)
+                if os.path.exists(swf_path):
+                    xmin, ymin, w, h = swf_rect_origin(swf_path)
                     ox, oy = int(xmin), int(ymin)
                     tw, th = max(1, int(w)), max(1, int(h))
-                    if img.width != tw or img.height != th:
+                    if tw > 0 and th > 0 and (img.width != tw or img.height != th):
                         img = img.resize((tw, th), Image.LANCZOS)
-                canvas.paste(img, (ox, oy), img)
+                fname = os.path.basename(swf_path).lower()
+                target = bg if any(k in fname for k in self._BG_LAYER_NAMES) else fg
+                target.paste(img, (ox, oy), img)
                 found = True
             except Exception:
                 pass
-        return canvas if found else None
+
+        return (bg, fg) if found else (None, None)
 
     def _on_view_change(self):
-        self._bind_sz_spins()
-        # Race-rear only exists in back view
-        back_state = 'normal' if self._view.get() == 'b' else 'disabled'
-        self._pos_chks['Back'].configure(state=back_state)
+        view = self._view.get()
         self._render()
+        # Auto-load overlays for this view if none have been loaded yet
+        if not any(k[0] == view for k in self._overlays):
+            self._load_overlays()
 
     def _render(self, *_):
         self._cv.delete('all')
@@ -494,10 +483,17 @@ class WheelPreviewWindow(tk.Toplevel):
         self._tk_ovls.clear()
         view = self._view.get()
         cs   = self.CANVAS_SCALE
+        sw   = int(self.STAGE_W * cs)
+        sh   = int(self.STAGE_H * cs)
 
-        composite = self._get_composite_image()
+        bg_img, fg_img = self._get_split_composite()
 
-        # 1. Tire and wheel overlays (bottom layer — behind car body)
+        # 1. Shadow / undercarriage (behind everything)
+        if bg_img:
+            self._tk_bg = ImageTk.PhotoImage(bg_img.resize((sw, sh), Image.LANCZOS))
+            self._cv.create_image(0, 0, anchor='nw', image=self._tk_bg)
+
+        # 2. Tire and wheel overlays (in front of shadow, behind car body)
         tire_positions = ['F', 'R'] + (['Back'] if view == 'b' else [])
         for layer in ('tire', 'wheel'):
             show_layer = self._show_tire if layer == 'tire' else self._show_wheel
@@ -513,29 +509,23 @@ class WheelPreviewWindow(tk.Toplevel):
                 wkey = (view, tire_pos)
                 if wkey not in self._wvars:
                     continue
-                scx  = self._wvars[wkey]['scx'].get() / 100.0
-                scy  = self._wvars[wkey]['scy'].get() / 100.0
-                dw   = max(1, int(img.width  * scx * cs))
-                dh   = max(1, int(img.height * scy * cs))
-                tx   = int(self._wvars[wkey]['tx'].get() * cs)
-                ty   = int(self._wvars[wkey]['ty'].get() * cs)
-                scaled = img.resize((dw, dh), Image.LANCZOS)
-                tkimg  = ImageTk.PhotoImage(scaled)
+                scx = self._wvars[wkey]['scx'].get() / 100.0
+                scy = self._wvars[wkey]['scy'].get() / 100.0
+                dw  = max(1, int(img.width  * scx * cs))
+                dh  = max(1, int(img.height * scy * cs))
+                tx  = int(self._wvars[wkey]['tx'].get() * cs)
+                ty  = int(self._wvars[wkey]['ty'].get() * cs)
+                tkimg = ImageTk.PhotoImage(img.resize((dw, dh), Image.LANCZOS))
                 self._tk_ovls.append(tkimg)
-                # tx/ty is the top-left of the tire clip (SWF registration point at origin)
                 self._cv.create_image(tx, ty, anchor='nw', image=tkimg)
 
-        # 2. Full car composite (all visual parts at correct stage positions)
-        if composite:
-            sw = int(self.STAGE_W * cs)
-            sh = int(self.STAGE_H * cs)
-            comp_scaled = composite.resize((sw, sh), Image.LANCZOS)
-            self._tk_img = ImageTk.PhotoImage(comp_scaled)
+        # 3. Car body / bumpers / roof (in front of tires)
+        if fg_img:
+            self._tk_img = ImageTk.PhotoImage(fg_img.resize((sw, sh), Image.LANCZOS))
             self._cv.create_image(0, 0, anchor='nw', image=self._tk_img)
-        else:
-            self._cv.create_text(int(self.STAGE_W * cs) // 2, int(self.STAGE_H * cs) // 2,
-                                  text='Load a car first', fill='#444',
-                                  font=('Segoe UI', 12))
+        elif not bg_img:
+            self._cv.create_text(sw // 2, sh // 2, text='Load a car first',
+                                  fill='#444', font=('Segoe UI', 12))
 
         # 3. Draggable circles — only for visible positions
         tires_for_view = ['F', 'R'] + (['Back'] if view == 'b' else [])
