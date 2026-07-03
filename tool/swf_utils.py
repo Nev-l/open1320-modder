@@ -564,11 +564,19 @@ def get_swf_badge_gap_ids(swf_path: str) -> list[int]:
     return [i for i in range(1, count + 1) if i not in existing]
 
 
+def _swf_decompress(raw: bytes) -> bytes:
+    """Return uncompressed SWF bytes; passes FWS through unchanged."""
+    if raw[:3] == b'CWS':
+        return b'FWS' + raw[3:8] + zlib.decompress(raw[8:])
+    return raw
+
+
 def swf_rect_origin(path: str) -> tuple:
     """Return (xmin_px, ymin_px, width_px, height_px) of a SWF's stage bounding box."""
     try:
         with open(path, 'rb') as f:
-            data = f.read(32)
+            raw = f.read()
+        data = _swf_decompress(raw)[:32]
         nbits = (data[8] >> 3) & 0x1F
         n_bytes = (5 + 4 * nbits + 7) // 8
         bits = int.from_bytes(data[8:8 + n_bytes], 'big')
@@ -595,7 +603,8 @@ def parse_tire_swf(path: str) -> dict:
     Returns dict with present keys; missing keys default to 100 for scx/scy, 0 for tx/ty."""
     try:
         with open(path, 'rb') as f:
-            data = bytearray(f.read())
+            raw = f.read()
+        data = bytearray(_swf_decompress(raw))
     except OSError:
         return {}
 
@@ -674,10 +683,12 @@ def parse_tire_swf(path: str) -> dict:
 def patch_tire_swf(src_path: str, dest_path: str, overrides: dict) -> bool:
     """Write a modified tire SWF with updated tx/ty/scx/scy values.
     overrides: {var_name: new_value}  — only specified variables are changed.
-    Supports int32 (type 0x07) and double (type 0x06) in-place patching."""
+    Supports int32 (type 0x07) and double (type 0x06) in-place patching.
+    CWS (compressed) SWFs are decompressed to FWS before patching."""
     try:
         with open(src_path, 'rb') as f:
-            data = bytearray(f.read())
+            raw = f.read()
+        data = bytearray(_swf_decompress(raw))
     except OSError:
         return False
 
