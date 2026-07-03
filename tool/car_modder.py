@@ -301,40 +301,60 @@ class WheelPreviewWindow(tk.Toplevel):
             ck.pack(side='left', padx=(0, 6))
             self._pos_chks[tire] = ck
 
-        # Column headers
-        for col, hdr in enumerate(['', 'X', 'Y', 'W%', 'H%'], start=1):
-            ttk.Label(pos_lf, text=hdr, foreground='#888',
-                      font=('Segoe UI', 7)).grid(row=1, column=col, padx=(2, 2))
-
-        def _spin(parent, dv, lo, hi):
+        def _spin(parent, dv, lo, hi, w=5):
             sp = tk.Spinbox(parent, textvariable=dv, from_=lo, to=hi, increment=1,
-                            width=5, bg="#16213e", fg=ACC, buttonbackground="#0f3460",
+                            width=w, bg="#16213e", fg=ACC, buttonbackground="#0f3460",
                             relief="flat", font=("Consolas", 8))
             dv.trace_add('write', lambda *_: self.after(0, self._render))
             return sp
 
-        def _wheel_rows(start_row, view):
+        def _wheel_block(parent_row, view):
             vu = view.upper()
-            ttk.Label(pos_lf, text=f'— {vu} View —', foreground='#555',
-                      font=('Segoe UI', 7)).grid(
-                row=start_row, column=0, columnspan=6, sticky='w', pady=(4, 1))
-            tires = [('F', 'Front'), ('R', 'Rear')] + ([('Back', 'Race-rear')] if view == 'b' else [])
-            for i, (tire, lbl) in enumerate(tires):
-                r = start_row + 1 + i
-                tk.Label(pos_lf, text='●', fg=self.TIRE_COLORS[tire],
-                         bg=BG, font=('Segoe UI', 9)).grid(row=r, column=0, sticky='w')
-                ttk.Label(pos_lf, text=lbl, font=('Segoe UI', 8),
-                          width=7).grid(row=r, column=1, sticky='w', padx=(0, 4))
-                wkey = (view, tire)
-                vars_ = self._wvars.get(wkey, {vn: tk.DoubleVar(value=100 if vn in ('scx','scy') else 0)
-                                               for vn in ('tx','ty','scx','scy')})
-                _spin(pos_lf, vars_['tx'],   -9999, 9999).grid(row=r, column=2, padx=2)
-                _spin(pos_lf, vars_['ty'],   -9999, 9999).grid(row=r, column=3, padx=2)
-                _spin(pos_lf, vars_['scx'],      1,  500).grid(row=r, column=4, padx=2)
-                _spin(pos_lf, vars_['scy'],      1,  500).grid(row=r, column=5, padx=2)
+            # Section divider
+            sep_fr = ttk.Frame(pos_lf)
+            sep_fr.grid(row=parent_row, column=0, columnspan=2, sticky='ew', pady=(6, 2))
+            ttk.Label(sep_fr, text=f'— {vu} View —', foreground='#555',
+                      font=('Segoe UI', 7, 'bold')).pack(side='left')
 
-        _wheel_rows(2, 'f')   # rows 3-4: Front view F, R
-        _wheel_rows(5, 'b')   # rows 6-9: Back view F, R, Back
+            tires = [('F', 'Front wheel'), ('R', 'Rear wheel')]
+            if view == 'b':
+                tires.append(('Back', 'Race rear'))
+
+            r = parent_row + 1
+            for tire, lbl in tires:
+                wkey  = (view, tire)
+                vars_ = self._wvars.get(wkey, {vn: tk.DoubleVar(
+                    value=100 if vn in ('scx','scy') else 0)
+                    for vn in ('tx','ty','scx','scy')})
+
+                # Row A: ● label   X:[  ]  Y:[  ]
+                row_a = ttk.Frame(pos_lf)
+                row_a.grid(row=r, column=0, columnspan=2, sticky='w', pady=(3, 0))
+                tk.Label(row_a, text='●', fg=self.TIRE_COLORS[tire],
+                         bg=BG, font=('Segoe UI', 9)).pack(side='left')
+                ttk.Label(row_a, text=lbl, font=('Segoe UI', 8),
+                          width=11).pack(side='left', padx=(2, 6))
+                ttk.Label(row_a, text='X:').pack(side='left')
+                _spin(row_a, vars_['tx'], -9999, 9999, 6).pack(side='left', padx=(2, 6))
+                ttk.Label(row_a, text='Y:').pack(side='left')
+                _spin(row_a, vars_['ty'], -9999, 9999, 6).pack(side='left', padx=(2, 0))
+
+                # Row B: (indent)   W%:[  ]  H%:[  ]
+                row_b = ttk.Frame(pos_lf)
+                row_b.grid(row=r+1, column=0, columnspan=2, sticky='w', pady=(1, 2))
+                ttk.Label(row_b, text='',
+                          width=13).pack(side='left')   # indent to match label above
+                ttk.Label(row_b, text='W%:', foreground='#888',
+                          font=('Segoe UI', 7)).pack(side='left')
+                _spin(row_b, vars_['scx'], 1, 500, 6).pack(side='left', padx=(2, 6))
+                ttk.Label(row_b, text='H%:', foreground='#888',
+                          font=('Segoe UI', 7)).pack(side='left')
+                _spin(row_b, vars_['scy'], 1, 500, 6).pack(side='left', padx=(2, 0))
+
+                r += 2
+
+        _wheel_block(1, 'f')
+        _wheel_block(8, 'b')
 
         # ── ROW 2: coord readout + Close ─────────────────────────────────────
         foot = ttk.Frame(self, padding=(8, 0, 8, 8))
@@ -2811,6 +2831,18 @@ class CarModderApp(tk.Tk):
                          variable=self._copy_cache).grid(row=2, column=0, columnspan=2,
                                                           sticky="w", pady=(4,0))
 
+        # ── Color lock ─────────────────────────────────────────────────────────
+        self._lock_color     = tk.BooleanVar(value=False)
+        self._lock_color_rgb = (200, 30, 30)  # default: red
+        color_fr = ttk.Frame(build_lf)
+        color_fr.grid(row=2, column=0, columnspan=2, sticky="w", pady=(24, 0))
+        ttk.Checkbutton(color_fr, text="Lock color (solid, no in-game repaint)",
+                        variable=self._lock_color).pack(side="left")
+        self._color_swatch = tk.Button(
+            color_fr, bg="#c81e1e", width=2, height=1, relief="solid",
+            command=self._pick_lock_color)
+        self._color_swatch.pack(side="left", padx=(6, 0))
+
         ttk.Button(build_lf, text="Clone & Build Car",
                     style="Warn.TButton",
                     command=self._build_car).grid(row=3, column=0, columnspan=2,
@@ -2856,10 +2888,10 @@ class CarModderApp(tk.Tk):
 
         # ── Wheel Aligner ──────────────────────────────────────────────────────
         ttk.Separator(build_lf, orient="horizontal").grid(
-            row=5, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+            row=13, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         ttk.Button(build_lf, text="Tire / Wheel Aligner…", style="Accent.TButton",
                    command=self._open_wheel_preview).grid(
-            row=6, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+            row=14, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
         # ── MAIN PANEL ────────────────────────────────────────────────────────
         main = ttk.Frame(tab, padding=(4,8,8,8))
@@ -3168,6 +3200,16 @@ class CarModderApp(tk.Tk):
             for var_name, dv in self._wheel_vars[key].items():
                 if var_name in vals:
                     dv.set(round(float(vals[var_name]), 2))
+
+    def _pick_lock_color(self):
+        from tkinter.colorchooser import askcolor
+        r, g, b = self._lock_color_rgb
+        init = f"#{r:02x}{g:02x}{b:02x}"
+        result = askcolor(color=init, title="Choose lock color")
+        if result and result[0]:
+            r, g, b = (int(c) for c in result[0])
+            self._lock_color_rgb = (r, g, b)
+            self._color_swatch.configure(bg=f"#{r:02x}{g:02x}{b:02x}")
 
     def _open_wheel_preview(self):
         if not self._slots:
@@ -3518,9 +3560,12 @@ class CarModderApp(tk.Tk):
                     out_swf = os.path.join(pkg_out, fname)
 
                 log(f"Building {fname}…")
+                do_lock = self._lock_color.get() and should_recolor(swf_path)
                 replacements = {}
                 for slot in swf_slots:
                     final = slot.final_image()
+                    if do_lock:
+                        final = _paint_tint(final, self._lock_color_rgb)
                     ext   = os.path.splitext(slot.orig_path)[1].lower()
                     tmp   = os.path.join(self._tmp,
                                           f"bld_{new_id}_{fname}_{slot.char_id}{ext}")
