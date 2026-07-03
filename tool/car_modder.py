@@ -214,7 +214,6 @@ class WheelPreviewWindow(tk.Toplevel):
 
         self._build_ui()
         self._render()
-        self.grab_set()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -346,6 +345,8 @@ class WheelPreviewWindow(tk.Toplevel):
             foreground='#555', font=('Segoe UI', 8))
         self._coord_lbl.pack(side='left')
         ttk.Button(foot, text='Close', command=self.destroy).pack(side='right')
+        ttk.Button(foot, text='Reset Positions',
+                   command=self._reset_positions).pack(side='right', padx=(0, 6))
 
     # ── Overlay loading ────────────────────────────────────────────────────────
 
@@ -610,6 +611,12 @@ class WheelPreviewWindow(tk.Toplevel):
     def _on_release(self, evt):
         self._drag = None
         self._cv.config(cursor='crosshair')
+        self._render()
+
+    def _reset_positions(self):
+        for key, vals in self._wsrc.items():
+            for vn, dv in self._wvars[key].items():
+                dv.set(vals.get(vn, 100 if vn in ('scx', 'scy') else 0))
         self._render()
 
 
@@ -2847,55 +2854,12 @@ class CarModderApp(tk.Tk):
                                          font=("Segoe UI", 8), wraplength=240)
         self._upload_status.grid(row=12, column=0, columnspan=2, sticky="w", pady=(2,0))
 
-        # ── Wheel Positions (inside build frame) ──────────────────────────────
+        # ── Wheel Aligner ──────────────────────────────────────────────────────
         ttk.Separator(build_lf, orient="horizontal").grid(
             row=5, column=0, columnspan=2, sticky="ew", pady=(8, 4))
-        ttk.Label(build_lf, text="Wheel Positions",
-                  font=("Segoe UI", 8, "bold"), foreground=ACC).grid(
-            row=6, column=0, columnspan=2, sticky="w", pady=(0, 4))
-
-        def _spin(parent, var, lo, hi):
-            return tk.Spinbox(parent, textvariable=var, from_=lo, to=hi, increment=1,
-                              width=5, bg="#16213e", fg=ACC, buttonbackground="#0f3460",
-                              relief="flat", font=("Consolas", 8))
-
-        def _wheel_row(row, label, vars_):
-            ttk.Label(build_lf, text=label, font=("Segoe UI", 8),
-                      anchor="w").grid(row=row, column=0, sticky="nw", pady=1)
-            sub = ttk.Frame(build_lf)
-            sub.grid(row=row, column=1, sticky="w")
-            # Position row
-            pos = ttk.Frame(sub); pos.pack(fill='x')
-            ttk.Label(pos, text="X:").pack(side="left")
-            _spin(pos, vars_['tx'], 0, 9999).pack(side="left", padx=(2, 6))
-            ttk.Label(pos, text="Y:").pack(side="left")
-            _spin(pos, vars_['ty'], 0, 9999).pack(side="left", padx=(2, 0))
-            # Scale row
-            sc = ttk.Frame(sub); sc.pack(fill='x', pady=(1, 0))
-            ttk.Label(sc, text="W%:", foreground="#888",
-                      font=("Segoe UI", 7)).pack(side="left")
-            _spin(sc, vars_['scx'], 1, 500).pack(side="left", padx=(2, 6))
-            ttk.Label(sc, text="H%:", foreground="#888",
-                      font=("Segoe UI", 7)).pack(side="left")
-            _spin(sc, vars_['scy'], 1, 500).pack(side="left", padx=(2, 0))
-
-        ttk.Label(build_lf, text="— Front view —", font=("Segoe UI", 7),
-                  foreground="#555").grid(row=7, column=0, columnspan=2, sticky="w")
-        _wheel_row(8,  "Front wheel (F)", self._wheel_vars[('f','F')])
-        _wheel_row(9,  "Rear wheel (F)",  self._wheel_vars[('f','R')])
-        ttk.Label(build_lf, text="— Back view —", font=("Segoe UI", 7),
-                  foreground="#555").grid(row=10, column=0, columnspan=2, sticky="w",
-                                          pady=(4, 0))
-        _wheel_row(11, "Front wheel (B)", self._wheel_vars[('b','F')])
-        _wheel_row(12, "Rear wheel (B)",  self._wheel_vars[('b','R')])
-        _wheel_row(13, "Race rear (B)",   self._wheel_vars[('b','Back')])
-        btn_row2 = ttk.Frame(build_lf)
-        btn_row2.grid(row=14, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Button(btn_row2, text="Preview & Drag…", style="Accent.TButton",
-                   command=self._open_wheel_preview).pack(side="left", fill="x",
-                                                           expand=True, padx=(0, 4))
-        ttk.Button(btn_row2, text="Reset",
-                   command=self._reset_wheel_positions).pack(side="left")
+        ttk.Button(build_lf, text="Tire / Wheel Aligner…", style="Accent.TButton",
+                   command=self._open_wheel_preview).grid(
+            row=6, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
         # ── MAIN PANEL ────────────────────────────────────────────────────────
         main = ttk.Frame(tab, padding=(4,8,8,8))
