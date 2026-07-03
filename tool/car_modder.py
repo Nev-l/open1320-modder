@@ -452,11 +452,34 @@ class WheelPreviewWindow(tk.Toplevel):
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
-    def _get_body_image(self):
-        view = self._view.get()
-        tag  = f"[{view.upper()}] body.swf"
-        slot = next((s for s in self._slots if tag in s.label), None)
-        return slot.final_image() if slot else None
+    # SWFs that carry position data, not visuals — skip when compositing
+    _SKIP_LABELS = {'tireF', 'tireR', 'wheelMaskAddF', 'wheelMaskAddR', 'decalLoader'}
+
+    def _get_composite_image(self):
+        """Composite all visual parts for the current view into one STAGE_W×STAGE_H image."""
+        view     = self._view.get()
+        view_tag = f"[{view.upper()}]"
+        canvas   = Image.new('RGBA', (self.STAGE_W, self.STAGE_H), (0, 0, 0, 0))
+        found    = False
+        for slot in self._slots:
+            if view_tag not in slot.label:
+                continue
+            if any(s in slot.label for s in self._SKIP_LABELS):
+                continue
+            try:
+                img = slot.final_image()
+                ox = oy = 0
+                if os.path.exists(slot.swf_path):
+                    xmin, ymin, w, h = swf_rect_origin(slot.swf_path)
+                    ox, oy = int(xmin), int(ymin)
+                    tw, th = max(1, int(w)), max(1, int(h))
+                    if img.width != tw or img.height != th:
+                        img = img.resize((tw, th), Image.LANCZOS)
+                canvas.paste(img, (ox, oy), img)
+                found = True
+            except Exception:
+                pass
+        return canvas if found else None
 
     def _on_view_change(self):
         self._bind_sz_spins()
@@ -472,8 +495,7 @@ class WheelPreviewWindow(tk.Toplevel):
         view = self._view.get()
         cs   = self.CANVAS_SCALE
 
-        bx, by = self._body_off.get(view, (0.0, 0.0))
-        body   = self._get_body_image()
+        composite = self._get_composite_image()
 
         # 1. Tire and wheel overlays (bottom layer — behind car body)
         tire_positions = ['F', 'R'] + (['Back'] if view == 'b' else [])
@@ -500,16 +522,16 @@ class WheelPreviewWindow(tk.Toplevel):
                 scaled = img.resize((dw, dh), Image.LANCZOS)
                 tkimg  = ImageTk.PhotoImage(scaled)
                 self._tk_ovls.append(tkimg)
-                self._cv.create_image(tx, ty, anchor='center', image=tkimg)
+                # tx/ty is the top-left of the tire clip (SWF registration point at origin)
+                self._cv.create_image(tx, ty, anchor='nw', image=tkimg)
 
-        # 2. Car body image (above tires/wheels)
-        if body:
-            bw, bh = self._body_size.get(view, (float(self.STAGE_W), float(self.STAGE_H)))
-            sw = max(1, int(bw * cs))
-            sh = max(1, int(bh * cs))
-            body_scaled = body.resize((sw, sh), Image.LANCZOS)
-            self._tk_img = ImageTk.PhotoImage(body_scaled)
-            self._cv.create_image(int(bx * cs), int(by * cs), anchor='nw', image=self._tk_img)
+        # 2. Full car composite (all visual parts at correct stage positions)
+        if composite:
+            sw = int(self.STAGE_W * cs)
+            sh = int(self.STAGE_H * cs)
+            comp_scaled = composite.resize((sw, sh), Image.LANCZOS)
+            self._tk_img = ImageTk.PhotoImage(comp_scaled)
+            self._cv.create_image(0, 0, anchor='nw', image=self._tk_img)
         else:
             self._cv.create_text(int(self.STAGE_W * cs) // 2, int(self.STAGE_H * cs) // 2,
                                   text='Load a car first', fill='#444',
