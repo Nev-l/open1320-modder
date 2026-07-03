@@ -1,0 +1,25 @@
+# Python build artifacts
+tool/build/
+tool/dist/
+tool/__pycache__/
+*.pyc
+*.pyo
+*.spec
+
+# Mod output (user-generated, not source)
+output/
+
+# AI training data outputs/logs (keep configs and raw images)
+ai_dataset/log/
+ai_dataset/output/
+
+# Large zip archives
+*.zip
+
+# App config (local paths, not portable)
+1320modder_config.json
+tool/1320modder_config.json
+
+# OS
+.DS_Store
+Thumbs.db
