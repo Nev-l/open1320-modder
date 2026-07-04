@@ -256,6 +256,11 @@ class WheelPreviewWindow(tk.Toplevel):
         self._ov_status  = tk.StringVar(value='Click "Load" to show tire/wheel images')
 
         self._build_ui()
+        # Force window open wide enough to show canvas + right control panel
+        cw = int(self.STAGE_W * self.CANVAS_SCALE)
+        ch = int(self.STAGE_H * self.CANVAS_SCALE)
+        self.minsize(cw + 360, ch + 120)
+        self.geometry(f'{cw + 380}x{ch + 160}')
         self._render()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -305,7 +310,8 @@ class WheelPreviewWindow(tk.Toplevel):
         # ── ROW 1: canvas (left) + position table (right) ────────────────────
         mid = tk.Frame(self, bg=BG)
         mid.grid(row=1, column=0, sticky='nsew', padx=8, pady=4)
-        mid.columnconfigure(1, weight=1)
+        mid.columnconfigure(0, weight=0)   # canvas: fixed
+        mid.columnconfigure(1, weight=1, minsize=320)   # controls: at least 320px
         mid.rowconfigure(0, weight=1)
 
         cs = self.CANVAS_SCALE
@@ -326,8 +332,10 @@ class WheelPreviewWindow(tk.Toplevel):
         self._cv.config(takefocus=True)
 
         # Right panel — Notebook with Wheels tab + Plate tab
-        right = tk.Frame(mid, bg=BG)
+        # width=320 + grid_propagate(False) ensures it never collapses to zero
+        right = tk.Frame(mid, bg=BG, width=320)
         right.grid(row=0, column=1, sticky='nsew', padx=(10, 0))
+        right.grid_propagate(False)
 
         nb = ttk.Notebook(right)
         nb.pack(fill='both', expand=True)
