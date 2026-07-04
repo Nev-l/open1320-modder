@@ -2581,54 +2581,87 @@ class RimEditorFrame(ttk.Frame):
         folder = filedialog.askdirectory(title='Select folder containing custom rim SWFs')
         if not folder:
             return
-        # Map partial name → view key
+
         VIEW_HINTS = [
             ('wheelFF', 'FF'), ('wheelFR', 'FR'), ('wheelBF', 'BF'), ('wheelBR', 'BR'),
-            ('wheelR',  'BF'),   # common alternate name for BF view
+            ('wheelR',  'BF'),
         ]
-        found: dict[str, str] = {}  # view → filepath
+        found: dict[str, str] = {}   # view → filepath
+        all_swfs: list[str]   = []   # every .swf in the folder
+
         for fname in os.listdir(folder):
             if not fname.lower().endswith('.swf'):
                 continue
+            fpath  = os.path.join(folder, fname)
             fupper = fname.upper()
+            all_swfs.append(fpath)
             for hint, view in VIEW_HINTS:
                 if hint.upper() in fupper and view not in found:
-                    found[view] = os.path.join(folder, fname)
+                    found[view] = fpath
                     break
 
-        if not found:
-            messagebox.showinfo('Custom Folder', 'No recognisable rim SWFs found.\n'
-                'Expected filenames containing: wheelFF, wheelFR, wheelBF, wheelBR (or wheelR).',
-                parent=self)
+        if not found and not all_swfs:
+            messagebox.showinfo('Custom Folder', 'No SWF files found in that folder.',
+                                parent=self)
             return
 
-        self._status.config(text=f'Loading {len(found)} custom SWF(s)…', foreground='#aaa')
-        threading.Thread(target=self._load_custom_worker, args=(found,), daemon=True).start()
+        # If nothing matched by name, just load all SWFs as FF view for preview
+        if not found:
+            found = {'FF': all_swfs[0]}
 
-    def _load_custom_worker(self, found: dict):
-        results = {}
-        for view, path in found.items():
-            out_dir = os.path.join(self._tmp, f'custom_{view}')
+        # Largest SWF is the main graphic — use as fallback for views with no images
+        largest = max(all_swfs, key=os.path.getsize) if all_swfs else None
+
+        self._status.config(text=f'Loading custom SWF(s)…', foreground='#aaa')
+        threading.Thread(target=self._load_custom_worker,
+                         args=(found, largest), daemon=True).start()
+
+    def _load_custom_worker(self, found: dict, largest: str | None):
+        # Try extracting image from each matched SWF; fall back to largest for empties
+        extracted: dict[str, tuple] = {}  # view → (img, path)
+        fallback_img = None
+
+        # Extract fallback image first (the biggest SWF = main graphic)
+        if largest:
             try:
-                img_path = export_image(path, out_dir)
-                img = Image.open(img_path).convert('RGBA') if img_path else None
+                img_path = export_image(largest, os.path.join(self._tmp, 'custom_main'))
+                if img_path:
+                    fallback_img = Image.open(img_path).convert('RGBA')
             except Exception:
-                img = None
-            results[view] = (img, path)
+                pass
+
+        for view, path in found.items():
+            img = None
+            if path != largest:
+                try:
+                    img_path = export_image(path, os.path.join(self._tmp, f'custom_{view}'))
+                    img = Image.open(img_path).convert('RGBA') if img_path else None
+                except Exception:
+                    pass
+            if img is None:
+                img = fallback_img  # position-only SWF — use the main graphic for preview
+            extracted[view] = (img, path)
+
+        # Any view not in found also gets the fallback
+        for view, _ in self.VIEWS:
+            if view not in extracted and fallback_img is not None:
+                extracted[view] = (fallback_img, largest)
 
         def _finish():
-            for view, (img, path) in results.items():
+            shown = 0
+            for view, (img, path) in extracted.items():
                 self._previews[view] = img
                 self._custom[view]   = path
                 lbl = dict(self.VIEWS).get(view, view)
                 if img:
                     self._view_panels[view]['lf'].configure(text=f'{lbl} [custom]')
                     self._refresh_preview(view)
+                    shown += 1
                 else:
-                    self._view_panels[view]['lf'].configure(text=f'{lbl} [load failed]')
+                    self._view_panels[view]['lf'].configure(text=f'{lbl} [no image]')
                     self._clear_canvas(view)
             self._status.config(
-                text=f'Custom folder loaded ({len(results)} views: {", ".join(results)}).',
+                text=f'Custom folder loaded — {shown} view(s) showing image.',
                 foreground='#aaa')
         self.after(0, _finish)
 
