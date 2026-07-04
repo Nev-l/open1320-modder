@@ -180,13 +180,16 @@ class WheelPreviewWindow(tk.Toplevel):
     TIRE_COLORS = {'F': '#00d4ff', 'R': '#ff6b6b', 'Back': '#00ff88'}
 
     def __init__(self, parent, slots: list, wheel_vars: dict,
-                 wheel_src: dict, pkg_info: dict, car_id: int, tmp_dir: str):
+                 wheel_src: dict, pkg_info: dict, car_id: int, tmp_dir: str,
+                 plate_vars: dict = None, plate_src: dict = None):
         super().__init__(parent, bg=BG)
-        self.title("Wheel Preview — drag circles to reposition")
+        self.title("Wheel & Plate Aligner — drag circles to reposition")
         self.resizable(False, False)
         self._slots     = slots
         self._wvars     = wheel_vars   # {(view,tire): {tx,ty}: DoubleVar}
         self._wsrc      = wheel_src    # {(view,tire): {tx,ty,scx,scy}: raw values
+        self._pvars     = plate_vars or {}   # {p1..p4: {tx,ty}: DoubleVar}
+        self._psrc      = plate_src  or {}   # {p1..p4: {tx,ty,...}: raw values
         self._pkg_info  = pkg_info
         self._car_id    = car_id
         self._tmp_dir   = tmp_dir
@@ -355,6 +358,28 @@ class WheelPreviewWindow(tk.Toplevel):
 
         _wheel_block(1, 'f')
         _wheel_block(8, 'b')
+
+        # ── Plate corner points ───────────────────────────────────────────────
+        plate_lf = ttk.LabelFrame(right, text="Plate Position (Back View)", padding=(8, 4))
+        plate_lf.pack(fill='x', pady=(8, 0))
+
+        ttk.Label(plate_lf, text="p1=BL  p2=BR  p3=TR  p4=TL", foreground='#555',
+                  font=('Segoe UI', 7)).grid(row=0, column=0, columnspan=4, sticky='w')
+
+        PLATE_COLORS = {'p1': '#ffaa00', 'p2': '#ff44cc', 'p3': '#44ffcc', 'p4': '#aaaaff'}
+        for pi, pt in enumerate(('p1','p2','p3','p4')):
+            pv = self._pvars.get(pt, {})
+            row_fr = ttk.Frame(plate_lf)
+            row_fr.grid(row=pi+1, column=0, columnspan=4, sticky='w', pady=(2,0))
+            tk.Label(row_fr, text='●', fg=PLATE_COLORS[pt],
+                     bg=BG, font=('Segoe UI', 9)).pack(side='left')
+            ttk.Label(row_fr, text=pt, font=('Segoe UI', 8), width=3).pack(side='left', padx=(2,6))
+            ttk.Label(row_fr, text='X:').pack(side='left')
+            tx_dv = pv.get('tx', tk.DoubleVar(value=0))
+            ty_dv = pv.get('ty', tk.DoubleVar(value=0))
+            _spin(row_fr, tx_dv, -9999, 9999, 6).pack(side='left', padx=(2, 6))
+            ttk.Label(row_fr, text='Y:').pack(side='left')
+            _spin(row_fr, ty_dv, -9999, 9999, 6).pack(side='left', padx=(2, 0))
 
         # ── ROW 2: coord readout + Close ─────────────────────────────────────
         foot = ttk.Frame(self, padding=(8, 0, 8, 8))
@@ -548,6 +573,29 @@ class WheelPreviewWindow(tk.Toplevel):
             self._cv.create_text(sw // 2, sh // 2, text='Load a car first',
                                   fill='#444', font=('Segoe UI', 12))
 
+        # 4. Plate quad (back view only) — outline + draggable corner handles
+        if view == 'b' and self._pvars:
+            PLATE_COLORS = {'p1': '#ffaa00', 'p2': '#ff44cc', 'p3': '#44ffcc', 'p4': '#aaaaff'}
+            pts_canvas = []
+            for pt in ('p1', 'p2', 'p3', 'p4'):
+                pv = self._pvars.get(pt, {})
+                tx = pv.get('tx', tk.DoubleVar(value=0)).get() * cs
+                ty = pv.get('ty', tk.DoubleVar(value=0)).get() * cs
+                pts_canvas.append((tx, ty))
+            # Draw quad outline (p1-p2-p3-p4 loop)
+            for i in range(4):
+                x0, y0 = pts_canvas[i]
+                x1, y1 = pts_canvas[(i+1) % 4]
+                self._cv.create_line(x0, y0, x1, y1, fill='#ffff00', width=1, dash=(4, 3))
+            # Draw corner handles
+            r = 7
+            for pt, (cx, cy) in zip(('p1','p2','p3','p4'), pts_canvas):
+                col = PLATE_COLORS[pt]
+                self._cv.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                      outline=col, fill='', width=2)
+                self._cv.create_text(cx, cy, text=pt, fill=col,
+                                      font=('Segoe UI', 6))
+
         # 3. Draggable circles — only for visible positions
         tires_for_view = ['F', 'R'] + (['Back'] if view == 'b' else [])
         for tire in tires_for_view:
@@ -637,6 +685,10 @@ class WheelPreviewWindow(tk.Toplevel):
         for key, vals in self._wsrc.items():
             for vn, dv in self._wvars[key].items():
                 dv.set(vals.get(vn, 100 if vn in ('scx', 'scy') else 0))
+        for pt, vals in self._psrc.items():
+            for vn, dv in self._pvars.get(pt, {}).items():
+                if vn in vals:
+                    dv.set(round(float(vals[vn]), 2))
         self._render()
 
 
@@ -2620,6 +2672,14 @@ class CarModderApp(tk.Tk):
                             'scx': tk.DoubleVar(value=100), 'scy': tk.DoubleVar(value=100)},
         }
         self._wheel_src: dict[tuple, dict] = {}  # original values from source car
+        # Plate corner points (p1-p4), back-view only
+        self._plate_vars: dict[str, dict[str, tk.DoubleVar]] = {
+            'p1': {'tx': tk.DoubleVar(value=451), 'ty': tk.DoubleVar(value=231)},
+            'p2': {'tx': tk.DoubleVar(value=538), 'ty': tk.DoubleVar(value=234)},
+            'p3': {'tx': tk.DoubleVar(value=542), 'ty': tk.DoubleVar(value=272)},
+            'p4': {'tx': tk.DoubleVar(value=455), 'ty': tk.DoubleVar(value=272)},
+        }
+        self._plate_src: dict[str, dict] = {}  # original values from source car
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -2831,11 +2891,11 @@ class CarModderApp(tk.Tk):
                          variable=self._copy_cache).grid(row=2, column=0, columnspan=2,
                                                           sticky="w", pady=(4,0))
 
-        # ── Color lock ─────────────────────────────────────────────────────────
+        # ── Color lock (row 3) ─────────────────────────────────────────────────
         self._lock_color     = tk.BooleanVar(value=False)
-        self._lock_color_rgb = (200, 30, 30)  # default: red
+        self._lock_color_rgb = (200, 30, 30)
         color_fr = ttk.Frame(build_lf)
-        color_fr.grid(row=2, column=0, columnspan=2, sticky="w", pady=(24, 0))
+        color_fr.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Checkbutton(color_fr, text="Lock color (solid, no in-game repaint)",
                         variable=self._lock_color).pack(side="left")
         self._color_swatch = tk.Button(
@@ -2845,53 +2905,53 @@ class CarModderApp(tk.Tk):
 
         ttk.Button(build_lf, text="Clone & Build Car",
                     style="Warn.TButton",
-                    command=self._build_car).grid(row=3, column=0, columnspan=2,
+                    command=self._build_car).grid(row=4, column=0, columnspan=2,
                                                    sticky="ew", pady=(6,0))
 
         self._build_status = ttk.Label(build_lf, text="", foreground="#aaa", wraplength=240)
-        self._build_status.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4,0))
+        self._build_status.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4,0))
 
         ttk.Separator(build_lf, orient="horizontal").grid(
-            row=5, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+            row=6, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         ttk.Label(build_lf, text="Upload to Server",
                   font=("Segoe UI", 8, "bold"), foreground=ACC).grid(
-            row=6, column=0, columnspan=2, sticky="w")
+            row=7, column=0, columnspan=2, sticky="w")
 
-        ttk.Label(build_lf, text="Author:").grid(row=7, column=0, sticky="w", pady=(4,0))
+        ttk.Label(build_lf, text="Author:").grid(row=8, column=0, sticky="w", pady=(4,0))
         self._upload_author = tk.StringVar(value="")
         ttk.Entry(build_lf, textvariable=self._upload_author).grid(
-            row=7, column=1, sticky="ew", pady=(4,0))
+            row=8, column=1, sticky="ew", pady=(4,0))
 
-        ttk.Label(build_lf, text="Description:").grid(row=8, column=0, sticky="w", pady=(2,0))
+        ttk.Label(build_lf, text="Description:").grid(row=9, column=0, sticky="w", pady=(2,0))
         self._upload_desc = tk.StringVar(value="")
         ttk.Entry(build_lf, textvariable=self._upload_desc).grid(
-            row=8, column=1, sticky="ew", pady=(2,0))
-
-        ttk.Label(build_lf, text="API Key:").grid(row=9, column=0, sticky="w", pady=(2,0))
-        self._upload_key = tk.StringVar(value="")
-        ttk.Entry(build_lf, textvariable=self._upload_key, show="*").grid(
             row=9, column=1, sticky="ew", pady=(2,0))
 
+        ttk.Label(build_lf, text="API Key:").grid(row=10, column=0, sticky="w", pady=(2,0))
+        self._upload_key = tk.StringVar(value="")
+        ttk.Entry(build_lf, textvariable=self._upload_key, show="*").grid(
+            row=10, column=1, sticky="ew", pady=(2,0))
+
         pub_fr = ttk.Frame(build_lf)
-        pub_fr.grid(row=10, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        pub_fr.grid(row=11, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self._upload_public = tk.BooleanVar(value=False)
         ttk.Checkbutton(pub_fr, text="Make public in installer",
                          variable=self._upload_public).pack(side="left")
 
         ttk.Button(build_lf, text="Upload to nitto.lol",
                     command=self._upload_to_server).grid(
-            row=11, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+            row=12, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         self._upload_status = ttk.Label(build_lf, text="", foreground="#aaa",
                                          font=("Segoe UI", 8), wraplength=240)
-        self._upload_status.grid(row=12, column=0, columnspan=2, sticky="w", pady=(2,0))
+        self._upload_status.grid(row=13, column=0, columnspan=2, sticky="w", pady=(2,0))
 
         # ── Wheel Aligner ──────────────────────────────────────────────────────
         ttk.Separator(build_lf, orient="horizontal").grid(
-            row=13, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+            row=14, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         ttk.Button(build_lf, text="Tire / Wheel Aligner…", style="Accent.TButton",
                    command=self._open_wheel_preview).grid(
-            row=14, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+            row=15, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
         # ── MAIN PANEL ────────────────────────────────────────────────────────
         main = ttk.Frame(tab, padding=(4,8,8,8))
@@ -3201,6 +3261,18 @@ class CarModderApp(tk.Tk):
                     if var_name in vals:
                         dv.set(round(float(vals[var_name]), 2))
 
+        # Load plate corner points (p1-p4) from back-view package if present
+        self._plate_src = {}
+        b_pkg = info.get('b', '')
+        for pt_key in ('p1', 'p2', 'p3', 'p4'):
+            path = os.path.join(b_pkg, f"{pt_key}.swf") if b_pkg else ''
+            vals = parse_tire_swf(path) if os.path.exists(path) else {}
+            self._plate_src[pt_key] = vals
+            pv = self._plate_vars.get(pt_key, {})
+            for var_name, dv in pv.items():
+                if var_name in vals:
+                    dv.set(round(float(vals[var_name]), 2))
+
     def _reset_wheel_positions(self):
         for key, vals in self._wheel_src.items():
             for var_name, dv in self._wheel_vars[key].items():
@@ -3224,7 +3296,9 @@ class CarModderApp(tk.Tk):
         car_id = self._get_src_id()
         WheelPreviewWindow(self, self._slots, self._wheel_vars,
                            self._wheel_src, self._pkg_info,
-                           car_id, self._tmp)
+                           car_id, self._tmp,
+                           plate_vars=self._plate_vars,
+                           plate_src=self._plate_src)
 
     # ── Slot selection / display ───────────────────────────────────────────────
 
@@ -3575,10 +3649,17 @@ class CarModderApp(tk.Tk):
 
         generated, errors = [], []
 
+        lock_color = self._lock_color.get()
+
         try:
             for swf_path, swf_slots in by_swf.items():
                 fname  = os.path.basename(swf_path)
                 parent = os.path.basename(os.path.dirname(swf_path))
+
+                # noPaint.swf controls in-game colour lock — skip it when unlocked;
+                # the lock step below will add/remove it explicitly.
+                if fname == 'noPaint.swf':
+                    continue
 
                 is_logo = fname == f"logo_{car_id}.swf"
                 if is_logo:
@@ -3591,11 +3672,11 @@ class CarModderApp(tk.Tk):
                     out_swf = os.path.join(pkg_out, fname)
 
                 log(f"Building {fname}…")
-                do_lock = self._lock_color.get() and should_recolor(swf_path)
+                do_tint = lock_color and should_recolor(swf_path)
                 replacements = {}
                 for slot in swf_slots:
                     final = slot.final_image()
-                    if do_lock:
+                    if do_tint:
                         final = _paint_tint(final, self._lock_color_rgb)
                     ext   = os.path.splitext(slot.orig_path)[1].lower()
                     tmp   = os.path.join(self._tmp,
@@ -3610,27 +3691,43 @@ class CarModderApp(tk.Tk):
                 if ok: generated.append(out_swf)
                 else:  errors.append(fname); log(f"✗ Failed: {fname}")
 
-            # Copy non-visual files (tyres etc.) to output package dirs
-            # and patch tire SWFs if wheel positions changed
+            # Copy non-visual files (tires, plate etc.) and patch changed values
             info = self._pkg_info.get(car_id, {})
+            # Template noPaint.swf from game cache (smallest available)
+            _np_template = os.path.join(PACKAGES_DIR, "109f", "noPaint.swf")
             for view in ("f","b"):
                 if view not in info: continue
                 src_pkg = info[view]
                 pkg_out = os.path.join(out_dir, "packages", f"{new_id}{view}")
                 os.makedirs(pkg_out, exist_ok=True)
+
+                # ── noPaint.swf: honour the lock-color checkbox ────────────────
+                np_out = os.path.join(pkg_out, "noPaint.swf")
+                np_src = os.path.join(src_pkg, "noPaint.swf")
+                if lock_color:
+                    # Ensure noPaint.swf is in output
+                    if os.path.exists(np_src):
+                        shutil.copy2(np_src, np_out)
+                    elif os.path.exists(_np_template):
+                        shutil.copy2(_np_template, np_out)
+                else:
+                    # Ensure noPaint.swf is NOT in output (remove if accidentally written)
+                    if os.path.exists(np_out):
+                        os.remove(np_out)
+
                 for f in os.listdir(src_pkg):
                     fp = os.path.join(src_pkg, f)
                     if not (f.endswith(".swf") and not should_recolor(fp)):
                         continue
+                    if f == 'noPaint.swf':
+                        continue  # handled above
                     dst = os.path.join(pkg_out, f)
-                    # Check if this is a tire positioning SWF with changed values
+
+                    # Tire positioning SWFs
                     tire_key = None
-                    if f == "tireF.swf":
-                        tire_key = (view, 'F')
-                    elif f == "tireR.swf":
-                        tire_key = (view, 'R')
-                    elif f == "tireBack.swf":
-                        tire_key = (view, 'Back')
+                    if f == "tireF.swf":    tire_key = (view, 'F')
+                    elif f == "tireR.swf":  tire_key = (view, 'R')
+                    elif f == "tireBack.swf": tire_key = (view, 'Back')
 
                     if tire_key and tire_key in self._wheel_src:
                         src_vals = self._wheel_src[tire_key]
@@ -3646,8 +3743,50 @@ class CarModderApp(tk.Tk):
                             generated.append(dst)
                             continue
 
+                    # Plate corner SWFs (p1-p4)
+                    plate_match = f in ('p1.swf', 'p2.swf', 'p3.swf', 'p4.swf')
+                    if plate_match:
+                        pt_key = f[:-4]  # 'p1','p2','p3','p4'
+                        pv = self._plate_vars.get(pt_key, {})
+                        if pv:
+                            src_vals = self._plate_src.get(pt_key, {})
+                            overrides = {}
+                            for vn, dv in pv.items():
+                                new_v = round(dv.get(), 2)
+                                old_v = round(float(src_vals.get(vn, new_v)), 2)
+                                if new_v != old_v:
+                                    overrides[vn] = new_v
+                            if overrides:
+                                log(f"Patching plate {pt_key} in {view.upper()}: {overrides}")
+                                patch_tire_swf(fp, dst, overrides)
+                                generated.append(dst)
+                                continue
+
                     if not os.path.exists(dst):
                         shutil.copy2(fp, dst)
+
+            # If user edited plate but source car had no p1-p4 SWFs, create them
+            # from game template (only for back view where plates live)
+            if any(self._plate_vars.get(k) for k in ('p1','p2','p3','p4')):
+                _plate_tmpl_dir = os.path.join(PACKAGES_DIR, "116b")
+                b_pkg_out = os.path.join(out_dir, "packages", f"{new_id}b")
+                b_src_pkg = info.get('b', '')
+                os.makedirs(b_pkg_out, exist_ok=True)
+                for pt_key in ('p1', 'p2', 'p3', 'p4'):
+                    pv = self._plate_vars.get(pt_key, {})
+                    if not pv:
+                        continue
+                    dst = os.path.join(b_pkg_out, f"{pt_key}.swf")
+                    if os.path.exists(dst):
+                        continue  # already written above
+                    src_exists = os.path.join(b_src_pkg, f"{pt_key}.swf") if b_src_pkg else ''
+                    tmpl = src_exists if os.path.exists(src_exists) else os.path.join(_plate_tmpl_dir, f"{pt_key}.swf")
+                    if not os.path.exists(tmpl):
+                        continue
+                    overrides = {vn: round(dv.get(), 2) for vn, dv in pv.items()}
+                    log(f"Writing plate {pt_key}: {overrides}")
+                    patch_tire_swf(tmpl, dst, overrides)
+                    generated.append(dst)
 
             # Copy to game cache
             if copy:
