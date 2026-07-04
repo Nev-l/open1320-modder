@@ -507,21 +507,35 @@ class InstallerApp(tk.Tk):
         if not sel:
             return
         pack = next((p for p in self._rims if p["id"] == sel[0]), None)
-        if pack:
-            lines = [
-                f"Name:    {pack.get('name','—')}",
-                f"Author:  {pack.get('author','—')}",
-                f"Rim slot:{pack.get('rim_id','—')}",
-                f"Files:   {len(pack.get('files',[]))}",
-                f"Version: {pack.get('version','1.0')}",
-            ]
-            desc = pack.get("description", "")
-            if desc:
-                lines += ["", desc]
-            self._info_text.configure(state="normal")
-            self._info_text.delete("1.0", "end")
-            self._info_text.insert("1.0", "\n".join(lines))
-            self._info_text.configure(state="disabled")
+        if not pack:
+            return
+        lines = [
+            f"Name:    {pack.get('name','—')}",
+            f"Author:  {pack.get('author','—')}",
+            f"Rim slot:{pack.get('rim_id','—')}",
+            f"Files:   {len(pack.get('files',[]))}",
+            f"Version: {pack.get('version','1.0')}",
+        ]
+        desc = pack.get("description", "")
+        if desc:
+            lines += ["", desc]
+        self._info_text.configure(state="normal")
+        self._info_text.delete("1.0", "end")
+        self._info_text.insert("1.0", "\n".join(lines))
+        self._info_text.configure(state="disabled")
+
+        # Load preview — prefer wheelFF, fall back to first available file
+        files = pack.get("files", [])
+        preview_file = (
+            next((f for f in files if "wheelff" in f.lower()), None)
+            or next((f for f in files), None)
+        )
+        if preview_file:
+            url = f"{SERVER}/mods/rims/{pack['id']}/{preview_file}"
+            threading.Thread(target=self._load_preview_swf,
+                              args=(url, {}), daemon=True).start()
+        else:
+            self._clear_preview("No preview")
 
     def _rim_select_all(self):
         for iid in self._rim_tree.get_children():
