@@ -2,7 +2,7 @@
 1320 Legends Car Modder
 Per-part image editing, custom image upload, overlay alignment, and badge editor.
 """
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 import os, sys, shutil, tempfile, threading, math, dataclasses, json, tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk, ImageDraw
@@ -2451,8 +2451,10 @@ class RimEditorFrame(ttk.Frame):
         self._tmp      = tmp_dir
         self._rim_id   = tk.IntVar(value=1)
         self._new_id   = tk.IntVar(value=200)
-        self._previews: dict[str, Image.Image | None] = {v: None for v, _ in self.VIEWS}
-        self._custom:   dict[str, str | None]         = {v: None for v, _ in self.VIEWS}
+        self._previews:   dict[str, Image.Image | None]              = {v: None for v, _ in self.VIEWS}
+        self._custom:     dict[str, str | None]                       = {v: None for v, _ in self.VIEWS}
+        self._char_ids:   dict[str, int | None]                       = {v: None for v, _ in self.VIEWS}
+        self._swf_images: dict[str, list[tuple[int, Image.Image]]]    = {v: []   for v, _ in self.VIEWS}
         self._tint_color = {v: '#ffffff' for v, _ in self.VIEWS}
         self._tint_str   = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
         self._bri        = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
@@ -2601,10 +2603,14 @@ class RimEditorFrame(ttk.Frame):
                        command=lambda v=view: self._upload(v)).pack(side='left', fill='x',
                                                                      expand=True, padx=(0, 2))
             ttk.Button(btn_fr, text='Reset',
-                       command=lambda v=view: self._reset_view(v)).pack(side='left')
+                       command=lambda v=view: self._reset_view(v)).pack(side='left', padx=(0, 2))
+            pick_btn = ttk.Button(btn_fr, text='Pick Image…',
+                                  command=lambda v=view: self._repick_image(v),
+                                  state='disabled')
+            pick_btn.pack(side='left')
 
             self._view_panels[view] = {'cv': cv, 'lf': lf, 'swatch': swatch,
-                                       'hex_var': hex_var}
+                                       'hex_var': hex_var, 'pick_btn': pick_btn}
 
     # ── Actions ────────────────────────────────────────────────────────────────
 
@@ -2623,23 +2629,52 @@ class RimEditorFrame(ttk.Frame):
         threading.Thread(target=self._load_worker, args=(rim_id,), daemon=True).start()
 
     def _load_worker(self, rim_id: int):
-        results = {}
-        for view, label in self.VIEWS:
-            results[view] = _get_rim_image(view, rim_id, self.WHEEL_DIR, self._tmp)
+        # For each view: extract all bitmaps via direct SWF parsing (fast, no FFDec).
+        # Falls back to _get_rim_image (FFDec) only when direct parse finds nothing.
+        results: dict[str, list[tuple[int, Image.Image]]] = {}
+        for view, _ in self.VIEWS:
+            swf = os.path.join(self.WHEEL_DIR, f"wheel{view}_{rim_id}.swf")
+            if not os.path.exists(swf):
+                results[view] = []
+                continue
+            pairs = read_swf_bitmap_ids(swf)  # [(char_id, PIL Image)…] largest-first
+            if pairs:
+                results[view] = pairs
+            else:
+                img = _get_rim_image(view, rim_id, self.WHEEL_DIR, self._tmp)
+                results[view] = [(0, img)] if img else []
 
         def _finish():
             missing = []
             for view, label in self.VIEWS:
-                img = results[view]
-                self._previews[view] = img
-                self._custom[view]   = None
-                if img is None:
+                pairs = results[view]
+                self._swf_images[view] = pairs
+                self._custom[view] = None
+                panel = self._view_panels[view]
+                if not pairs:
                     missing.append(view)
-                    self._view_panels[view]['lf'].configure(text=f'{view} — not found')
+                    self._previews[view] = None
+                    self._char_ids[view] = None
+                    panel['lf'].configure(text=f'{view} — not found')
+                    panel['pick_btn'].config(state='disabled')
                     self._clear_canvas(view)
                 else:
-                    self._view_panels[view]['lf'].configure(text=label)
+                    if len(pairs) > 1:
+                        # Multiple images — auto-select largest but let user re-pick
+                        cid, img = pairs[0]
+                        panel['lf'].configure(text=f'{label}  [{len(pairs)} images — click Pick Image]')
+                        panel['pick_btn'].config(state='normal')
+                    else:
+                        cid, img = pairs[0]
+                        panel['lf'].configure(text=label)
+                        panel['pick_btn'].config(state='disabled')
+                    self._previews[view] = img
+                    self._char_ids[view] = cid if cid != 0 else None
                     self._refresh_preview(view)
+            # Auto-show picker for views that have multiple images
+            for view, label in self.VIEWS:
+                if len(results[view]) > 1:
+                    self._repick_image(view)
             msg = f'Rim {rim_id} loaded.'
             if missing:
                 msg += f'  (missing: {", ".join(missing)})'
@@ -2795,6 +2830,82 @@ class RimEditorFrame(ttk.Frame):
                 foreground='#aaa')
         self.after(0, _finish)
 
+    # ── Image picker ──────────────────────────────────────────────────────────
+
+    def _repick_image(self, view: str):
+        """Show a modal dialog for the user to select which bitmap from the SWF to use."""
+        pairs = self._swf_images.get(view, [])
+        if not pairs:
+            return
+        if len(pairs) == 1:
+            # Only one option — just set it
+            cid, img = pairs[0]
+            self._previews[view] = img
+            self._char_ids[view] = cid if cid != 0 else None
+            self._refresh_preview(view)
+            return
+
+        THUMB = 96
+        win = tk.Toplevel(self)
+        win.title(f'Select image for view {view}')
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.grab_set()
+
+        label_txt = dict(self.VIEWS).get(view, view)
+        ttk.Label(win,
+                  text=f'{label_txt} — {len(pairs)} bitmaps found. Click the correct rim image.',
+                  font=('Segoe UI', 9)).pack(padx=12, pady=(10, 6), anchor='w')
+
+        grid_fr = ttk.Frame(win, padding=(8, 0, 8, 8))
+        grid_fr.pack()
+
+        result = [None]  # [(cid, img)]
+
+        def _pick(cid, img):
+            result[0] = (cid, img)
+            win.destroy()
+
+        tk_refs = []
+        for col, (cid, img) in enumerate(pairs):
+            cell = ttk.Frame(grid_fr, padding=4)
+            cell.grid(row=0, column=col, padx=4)
+
+            thumb = img.copy()
+            thumb.thumbnail((THUMB, THUMB), Image.LANCZOS)
+            # Composite onto grey background so transparent areas are visible
+            bg = Image.new('RGBA', (THUMB, THUMB), (100, 100, 100, 255))
+            ox = (THUMB - thumb.width) // 2
+            oy = (THUMB - thumb.height) // 2
+            bg.paste(thumb, (ox, oy), thumb)
+            tkimg = ImageTk.PhotoImage(bg)
+            tk_refs.append(tkimg)
+
+            btn = tk.Button(cell, image=tkimg, relief='flat', bd=2,
+                            bg=MID, activebackground=ACC,
+                            command=lambda c=cid, i=img: _pick(c, i))
+            btn.pack()
+            size_kb = img.width * img.height * 4 // 1024
+            ttk.Label(cell,
+                      text=f'ID {cid}\n{img.width}×{img.height}',
+                      font=('Consolas', 7), foreground='#aaa',
+                      justify='center').pack()
+
+        ttk.Button(win, text='Cancel', command=win.destroy).pack(pady=(0, 8))
+
+        # Keep tk_refs alive
+        win._tk_refs = tk_refs
+        self.wait_window(win)
+
+        if result[0] is not None:
+            cid, img = result[0]
+            self._previews[view] = img
+            self._char_ids[view] = cid if cid != 0 else None
+            panel = self._view_panels[view]
+            label_txt = dict(self.VIEWS).get(view, view)
+            panel['lf'].configure(text=f'{label_txt}  [ID {cid} selected]')
+            self._refresh_preview(view)
+
     # ── Color helpers ──────────────────────────────────────────────────────────
 
     def _set_view_color(self, view: str, hex_color: str):
@@ -2918,6 +3029,7 @@ class RimEditorFrame(ttk.Frame):
                 'bri':      self._bri[view].get() / 100.0,
                 'preview':  self._previews.get(view),
                 'custom':   self._custom.get(view),
+                'char_id':  self._char_ids.get(view),   # user-selected char_id (may be None)
             }
             for view, _ in self.VIEWS
         }
@@ -2937,8 +3049,12 @@ class RimEditorFrame(ttk.Frame):
             if not imgs:
                 errors.append(f'{view}:no-img')
                 continue
-            # Use the largest exported image's char_id — matches what export_image() picks
-            char_id = max(imgs, key=lambda k: os.path.getsize(imgs[k]))
+            # Use the char_id the user selected in the picker; fall back to largest file.
+            preferred = params[view].get('char_id')
+            if preferred is not None and preferred in imgs:
+                char_id = preferred
+            else:
+                char_id = max(imgs, key=lambda k: os.path.getsize(imgs[k]))
             p         = params[view]
             src_img   = p['preview']
             custom_path = p['custom']

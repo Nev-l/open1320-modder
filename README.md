@@ -9,6 +9,9 @@ Car modding tools for Nitto Legends (open1320 / nittolol clients).
 
 ## Changelog
 
+### v0.3.7
+- **Rim image picker** — when a wheel SWF contains more than one bitmap (e.g. a rim image plus an alpha mask), loading now auto-shows a thumbnail picker for each affected view so you can click the correct image. "Pick Image…" button on each view panel lets you re-pick at any time. The selected char_id is remembered and used when building, so the right bitmap gets replaced in the output SWF.
+
 ### v0.3.6
 - **Fix rim images loading incorrectly from source SWF**: `export_all_images` was reusing the same output directory across calls without clearing it. Stale `{char_id}.png` files from previous extractions would accumulate and be picked up by `glob`, causing the wrong image to be returned. Directory is now wiped clean before each FFDec export.
 - **Fix rim FF (and any view) sometimes not rewritten on rebuild**: when the source and output SWF path are the same file (rebuilding same slot), FFDec could open the output for writing before finishing the read, producing an empty or unchanged result. Source is now copied to a temp file first when src == dst.
