@@ -2190,6 +2190,10 @@ class RimEditorFrame(ttk.Frame):
         self._tint_color = {v: '#ffffff' for v, _ in self.VIEWS}
         self._tint_str   = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
         self._bri        = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
+        # Global "apply to all" vars
+        self._all_color  = '#ffffff'
+        self._all_str    = tk.DoubleVar(value=0)
+        self._all_bri    = tk.DoubleVar(value=0)
         self._tk_imgs: list = []
         self._build_ui()
 
@@ -2197,7 +2201,7 @@ class RimEditorFrame(ttk.Frame):
 
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
 
         # ── Top bar ────────────────────────────────────────────────────────────
         top = ttk.Frame(self)
@@ -2221,9 +2225,41 @@ class RimEditorFrame(ttk.Frame):
                                   foreground='#aaa')
         self._status.pack(side='left', padx=(12, 0))
 
+        # ── Apply-to-all row ───────────────────────────────────────────────────
+        all_row = ttk.LabelFrame(self, text='Apply to All Views', padding=(8, 4))
+        all_row.grid(row=1, column=0, sticky='ew', pady=(0, 6))
+
+        ttk.Label(all_row, text='Color:').pack(side='left')
+        self._all_swatch = tk.Label(all_row, bg='#ffffff', width=3, relief='raised',
+                                     cursor='hand2')
+        self._all_swatch.pack(side='left', padx=(4, 0))
+        self._all_swatch.bind('<Button-1>', self._pick_all_color)
+        self._all_hex = tk.StringVar(value='#ffffff')
+        hex_e = ttk.Entry(all_row, textvariable=self._all_hex, width=8)
+        hex_e.pack(side='left', padx=(4, 0))
+        hex_e.bind('<Return>', self._apply_all_hex)
+        hex_e.bind('<FocusOut>', self._apply_all_hex)
+
+        ttk.Separator(all_row, orient='vertical').pack(side='left', fill='y', padx=8)
+        ttk.Label(all_row, text='Strength:').pack(side='left')
+        tk.Scale(all_row, variable=self._all_str, from_=0, to=100,
+                 orient='horizontal', length=120, bg=BG, fg=FG, troughcolor=DARK,
+                 showvalue=1, font=('Segoe UI', 7), activebackground=ACC,
+                 highlightthickness=0).pack(side='left', padx=(4, 0))
+
+        ttk.Separator(all_row, orient='vertical').pack(side='left', fill='y', padx=8)
+        ttk.Label(all_row, text='Brightness:').pack(side='left')
+        tk.Scale(all_row, variable=self._all_bri, from_=-100, to=100,
+                 orient='horizontal', length=120, bg=BG, fg=FG, troughcolor=DARK,
+                 showvalue=1, font=('Segoe UI', 7), activebackground=ACC,
+                 highlightthickness=0).pack(side='left', padx=(4, 0))
+
+        ttk.Button(all_row, text='Apply to All Views', style='Accent.TButton',
+                   command=self._apply_to_all).pack(side='left', padx=(12, 0))
+
         # ── View panels ────────────────────────────────────────────────────────
         views_fr = ttk.Frame(self)
-        views_fr.grid(row=1, column=0, sticky='nsew')
+        views_fr.grid(row=2, column=0, sticky='nsew')
         for ci in range(4):
             views_fr.columnconfigure(ci, weight=1)
         views_fr.rowconfigure(0, weight=1)
@@ -2247,6 +2283,12 @@ class RimEditorFrame(ttk.Frame):
             swatch = tk.Label(tint_row, bg='#ffffff', width=3, relief='raised', cursor='hand2')
             swatch.pack(side='left', padx=(4, 0))
             swatch.bind('<Button-1>', lambda e, v=view: self._pick_color(v))
+            hex_var = tk.StringVar(value='#ffffff')
+            hex_entry = ttk.Entry(tint_row, textvariable=hex_var, width=8,
+                                  font=('Segoe UI', 7))
+            hex_entry.pack(side='left', padx=(3, 0))
+            hex_entry.bind('<Return>',    lambda e, v=view: self._apply_hex(v))
+            hex_entry.bind('<FocusOut>',  lambda e, v=view: self._apply_hex(v))
 
             # Tint strength slider
             ttk.Label(lf, text='Strength', foreground='#888',
@@ -2277,7 +2319,8 @@ class RimEditorFrame(ttk.Frame):
             ttk.Button(btn_fr, text='Reset',
                        command=lambda v=view: self._reset_view(v)).pack(side='left')
 
-            self._view_panels[view] = {'cv': cv, 'lf': lf, 'swatch': swatch}
+            self._view_panels[view] = {'cv': cv, 'lf': lf, 'swatch': swatch,
+                                       'hex_var': hex_var}
 
     # ── Actions ────────────────────────────────────────────────────────────────
 
@@ -2324,13 +2367,67 @@ class RimEditorFrame(ttk.Frame):
 
         self.after(0, _finish)
 
+    # ── Color helpers ──────────────────────────────────────────────────────────
+
+    def _set_view_color(self, view: str, hex_color: str):
+        """Update a single view's tint color and sync swatch + hex entry."""
+        self._tint_color[view] = hex_color
+        panel = self._view_panels.get(view)
+        if panel:
+            panel['swatch'].config(bg=hex_color)
+            panel['hex_var'].set(hex_color)
+        self._refresh_preview(view)
+
     def _pick_color(self, view: str):
         from tkinter.colorchooser import askcolor
-        initial = self._tint_color.get(view, '#ffffff')
-        result = askcolor(color=initial, title=f'Rim tint color — {view}')
+        result = askcolor(color=self._tint_color.get(view, '#ffffff'),
+                          title=f'Rim tint color — {view}')
         if result and result[1]:
-            self._tint_color[view] = result[1]
-            self._view_panels[view]['swatch'].config(bg=result[1])
+            self._set_view_color(view, result[1])
+
+    def _apply_hex(self, view: str, _event=None):
+        raw = self._view_panels[view]['hex_var'].get().strip()
+        if not raw.startswith('#'):
+            raw = '#' + raw
+        try:
+            int(raw[1:], 16)
+            if len(raw) in (4, 7):
+                self._set_view_color(view, raw.lower())
+        except ValueError:
+            pass
+
+    def _pick_all_color(self, _event=None):
+        from tkinter.colorchooser import askcolor
+        result = askcolor(color=self._all_color, title='Apply tint to all views')
+        if result and result[1]:
+            self._all_color = result[1]
+            self._all_swatch.config(bg=result[1])
+            self._all_hex.set(result[1])
+
+    def _apply_all_hex(self, _event=None):
+        raw = self._all_hex.get().strip()
+        if not raw.startswith('#'):
+            raw = '#' + raw
+        try:
+            int(raw[1:], 16)
+            if len(raw) in (4, 7):
+                self._all_color = raw.lower()
+                self._all_swatch.config(bg=raw.lower())
+        except ValueError:
+            pass
+
+    def _apply_to_all(self):
+        color = self._all_color
+        strength = self._all_str.get()
+        bri = self._all_bri.get()
+        for view, _ in self.VIEWS:
+            self._tint_color[view] = color
+            self._tint_str[view].set(strength)
+            self._bri[view].set(bri)
+            panel = self._view_panels.get(view)
+            if panel:
+                panel['swatch'].config(bg=color)
+                panel['hex_var'].set(color)
             self._refresh_preview(view)
 
     def _refresh_preview(self, view: str):
@@ -2375,12 +2472,10 @@ class RimEditorFrame(ttk.Frame):
         self._refresh_preview(view)
 
     def _reset_view(self, view: str):
-        self._custom[view]       = None
-        self._tint_color[view]   = '#ffffff'
+        self._custom[view] = None
         self._tint_str[view].set(0)
         self._bri[view].set(0)
-        self._view_panels[view]['swatch'].config(bg='#ffffff')
-        self._refresh_preview(view)
+        self._set_view_color(view, '#ffffff')  # also resets swatch + hex_var
 
     def _build_rim(self):
         new_id = self._new_id.get()
