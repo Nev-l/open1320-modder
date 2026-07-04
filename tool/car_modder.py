@@ -2172,6 +2172,133 @@ class BadgeData:
     new_large:   str  | None = None # user-supplied large image path (or None = auto)
 
 
+# ── Rim Browser popup ─────────────────────────────────────────────────────────
+
+class RimBrowserWindow(tk.Toplevel):
+    """Scrollable thumbnail grid of all available rim IDs. Click to select."""
+    THUMB = 72
+    PAD   = 6
+    COLS  = 8
+
+    def __init__(self, parent, wheel_dir: str, tmp_dir: str, on_select):
+        super().__init__(parent)
+        self.title("Rim Browser — click a rim to load it")
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self._wheel_dir = wheel_dir
+        self._tmp       = tmp_dir
+        self._on_select = on_select
+        self._thumbs: list = []
+        self._rim_ids: list[int] = []
+        self._build_ui()
+        self._scan_and_load()
+
+    def _build_ui(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(self, padding=(6, 4))
+        top.grid(row=0, column=0, sticky='ew')
+        self._status = ttk.Label(top, text='Scanning rims…', foreground='#aaa')
+        self._status.pack(side='left')
+
+        cv_fr = ttk.Frame(self)
+        cv_fr.grid(row=1, column=0, sticky='nsew')
+        cv_fr.columnconfigure(0, weight=1)
+        cv_fr.rowconfigure(0, weight=1)
+
+        T, P, C = self.THUMB, self.PAD, self.COLS
+        w = C * (T + P) + P
+        self._cv = tk.Canvas(cv_fr, bg=DARK, width=w, height=500,
+                              highlightthickness=0)
+        sb = ttk.Scrollbar(cv_fr, orient='vertical', command=self._cv.yview)
+        self._cv.configure(yscrollcommand=sb.set)
+        self._cv.grid(row=0, column=0, sticky='nsew')
+        sb.grid(row=0, column=1, sticky='ns')
+        self._cv.bind('<Button-1>', self._on_click)
+        self._cv.bind('<MouseWheel>', lambda e: self._cv.yview_scroll(
+            -1 if e.delta > 0 else 1, 'units'))
+
+    def _scan_and_load(self):
+        ids = set()
+        for f in os.listdir(self._wheel_dir):
+            if f.startswith('wheelFF_') and f.endswith('.swf'):
+                try:
+                    ids.add(int(f[8:-4]))
+                except ValueError:
+                    pass
+        self._rim_ids = sorted(ids)
+        T, P, C = self.THUMB, self.PAD, self.COLS
+        rows = (len(self._rim_ids) + C - 1) // C
+        self._cv.configure(scrollregion=(0, 0, C*(T+P)+P, rows*(T+P)+P))
+        self._thumbs = [None] * len(self._rim_ids)
+
+        # Draw placeholders
+        for idx, rid in enumerate(self._rim_ids):
+            col = idx % C
+            row = idx // C
+            x = P + col * (T + P)
+            y = P + row * (T + P)
+            tag = f'r{rid}'
+            self._cv.create_rectangle(x, y, x+T, y+T, fill='#222', outline='', tags=tag)
+            self._cv.create_text(x + T//2, y + T - 10, text=str(rid),
+                                  fill='#666', font=('Consolas', 7), tags=tag)
+
+        self._status.config(text=f'{len(self._rim_ids)} rims found. Loading previews…')
+        threading.Thread(target=self._export_worker, daemon=True).start()
+
+    def _export_worker(self):
+        for idx, rid in enumerate(self._rim_ids):
+            swf = os.path.join(self._wheel_dir, f'wheelFF_{rid}.swf')
+            out_dir = os.path.join(self._tmp, f'rbr_{rid}')
+            try:
+                img_path = export_image(swf, out_dir)
+                if img_path:
+                    img = Image.open(img_path).convert('RGBA')
+                    T = self.THUMB
+                    bg = Image.new('RGBA', (T, T), (80, 80, 80, 255))
+                    raw_w, raw_h = img.size
+                    scale = min(T / raw_w, T / raw_h)
+                    nw, nh = max(1, int(raw_w*scale)), max(1, int(raw_h*scale))
+                    img = img.resize((nw, nh), Image.LANCZOS)
+                    ox, oy = (T-nw)//2, (T-nh)//2
+                    bg.paste(img, (ox, oy), img)
+                    self.after(0, self._place_thumb, idx, rid, bg)
+            except Exception:
+                pass
+        self.after(0, lambda: self._status.config(
+            text=f'{len(self._rim_ids)} rims. Click to select.', foreground='#aaa'))
+
+    def _place_thumb(self, idx: int, rid: int, img: Image.Image):
+        try:
+            tk_img = ImageTk.PhotoImage(img)
+            self._thumbs[idx] = tk_img
+            T, P, C = self.THUMB, self.PAD, self.COLS
+            col = idx % C
+            row = idx // C
+            x = P + col * (T + P)
+            y = P + row * (T + P)
+            tag = f'r{rid}'
+            self._cv.delete(tag)
+            self._cv.create_image(x, y, anchor='nw', image=tk_img, tags=tag)
+            self._cv.create_text(x + T//2, y + T - 10, text=str(rid),
+                                  fill='#eee', font=('Consolas', 7, 'bold'), tags=tag)
+        except Exception:
+            pass
+
+    def _on_click(self, event):
+        T, P, C = self.THUMB, self.PAD, self.COLS
+        cx = self._cv.canvasx(event.x)
+        cy = self._cv.canvasy(event.y)
+        col = int(cx - P) // (T + P)
+        row = int(cy - P) // (T + P)
+        idx = row * C + col
+        if 0 <= idx < len(self._rim_ids):
+            rid = self._rim_ids[idx]
+            self._on_select(rid)
+            self.destroy()
+
+
 # ── Rim Editor ────────────────────────────────────────────────────────────────
 
 class RimEditorFrame(ttk.Frame):
@@ -2212,6 +2339,8 @@ class RimEditorFrame(ttk.Frame):
                     width=5).pack(side='left', padx=(4, 0))
         ttk.Button(top, text='Load', style='Accent.TButton',
                    command=self._load_rim).pack(side='left', padx=(6, 0))
+        ttk.Button(top, text='Browse…',
+                   command=self._open_browser).pack(side='left', padx=(4, 0))
 
         ttk.Separator(top, orient='vertical').pack(side='left', fill='y', padx=12)
 
@@ -2326,6 +2455,12 @@ class RimEditorFrame(ttk.Frame):
 
     # Neutral mid-grey used as the preview background so transparent rim areas show
     _PREVIEW_BG = (120, 120, 120, 255)
+
+    def _open_browser(self):
+        def _select(rid: int):
+            self._rim_id.set(rid)
+            self._load_rim()
+        RimBrowserWindow(self, self.WHEEL_DIR, self._tmp, _select)
 
     def _load_rim(self):
         rim_id = self._rim_id.get()
@@ -3717,25 +3852,41 @@ class CarModderApp(tk.Tk):
         self._orig_info.config(text=f"{img.width}×{img.height}px  |  {slot.orig_path}")
 
     def _draw_mod(self, slot: ImageSlot):
-        img = slot.final_image()
-        self._c_mod.update_idletasks()
+        """Composite and display the modified image. Runs the heavy work in a thread."""
+        self._mod_info.config(text="Compositing…", foreground="#aaa")
+        threading.Thread(target=self._draw_mod_worker, args=(slot,), daemon=True).start()
+
+    def _draw_mod_worker(self, slot: ImageSlot):
+        try:
+            img = slot.final_image()
+        except Exception as e:
+            self.after(0, lambda: self._mod_info.config(
+                text=f"Error: {e}", foreground="#e94560"))
+            return
         w = max(self._c_mod.winfo_width(), 100)
         h = max(self._c_mod.winfo_height(), 100)
-        thumb = img.copy(); thumb.thumbnail((w, h), Image.LANCZOS)
-        self._tk_mod = ImageTk.PhotoImage(thumb)
-        self._c_mod.delete("all")
-        self._c_mod.create_image(w//2, h//2, image=self._tk_mod, anchor="center")
-        src_note = f"  [custom: {os.path.basename(slot.custom_path)}]" if slot.custom_path else ""
-        self._mod_info.config(
-            text=f"H:{slot.hue:+.0f}° S:{slot.sat:.2f}x B:{slot.bri:.2f}x{src_note}")
-        # Refresh list item to show star
-        try:
-            idx = self._slots.index(slot)
-            self._lb.delete(idx)
-            self._lb.insert(idx, slot.label + ("  ★" if slot.is_modified else ""))
-            self._lb.selection_set(idx)
-        except ValueError:
-            pass
+        thumb = img.copy()
+        thumb.thumbnail((w, h), Image.LANCZOS)
+        tk_img = ImageTk.PhotoImage(thumb)
+        src_note = (f"  [custom: {os.path.basename(slot.custom_path)}]"
+                    if slot.custom_path else "")
+
+        def _update():
+            self._tk_mod = tk_img   # keep reference alive
+            self._c_mod.delete("all")
+            self._c_mod.create_image(w // 2, h // 2, image=self._tk_mod, anchor="center")
+            self._mod_info.config(
+                text=f"H:{slot.hue:+.0f}° S:{slot.sat:.2f}x B:{slot.bri:.2f}x{src_note}",
+                foreground=FG)
+            try:
+                idx = self._slots.index(slot)
+                self._lb.delete(idx)
+                self._lb.insert(idx, slot.label + ("  ★" if slot.is_modified else ""))
+                self._lb.selection_set(idx)
+            except ValueError:
+                pass
+
+        self.after(0, _update)
 
     # ── Color sliders ──────────────────────────────────────────────────────────
 

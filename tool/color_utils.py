@@ -97,43 +97,98 @@ def apply_color_adjustments(
     return img
 
 
+def _parse_hex(color_hex: str) -> tuple[float, float, float]:
+    h = color_hex.lstrip('#')
+    if len(h) == 3:
+        h = h[0]*2 + h[1]*2 + h[2]*2
+    return int(h[0:2], 16)/255.0, int(h[2:4], 16)/255.0, int(h[4:6], 16)/255.0
+
+
+def _rgb_to_hls_vec(r: np.ndarray, g: np.ndarray, b: np.ndarray):
+    """Vectorised RGB→HLS (all arrays 0-1). Returns h, l, s arrays."""
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    delta = cmax - cmin
+
+    l = (cmax + cmin) / 2.0
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        s = np.where(delta == 0, 0.0,
+                     delta / np.where(l < 0.5, (cmax + cmin),
+                                      2.0 - cmax - cmin))
+
+    h = np.zeros_like(r)
+    mask_r = (cmax == r) & (delta != 0)
+    mask_g = (cmax == g) & (delta != 0)
+    mask_b = (cmax == b) & (delta != 0)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        h[mask_r] = ((g[mask_r] - b[mask_r]) / delta[mask_r]) % 6
+        h[mask_g] = (b[mask_g] - r[mask_g]) / delta[mask_g] + 2
+        h[mask_b] = (r[mask_b] - g[mask_b]) / delta[mask_b] + 4
+    h = h / 6.0
+
+    return h, l, s
+
+
+def _hls_to_rgb_vec(h: np.ndarray, l: np.ndarray, s: np.ndarray):
+    """Vectorised HLS→RGB. Returns r, g, b arrays 0-1."""
+    c  = (1.0 - np.abs(2.0 * l - 1.0)) * s
+    x  = c * (1.0 - np.abs((h * 6.0) % 2.0 - 1.0))
+    m  = l - c / 2.0
+    hi = (h * 6.0).astype(int) % 6
+
+    r = np.select([hi==0, hi==1, hi==2, hi==3, hi==4, hi==5], [c, x, 0, 0, x, c])
+    g = np.select([hi==0, hi==1, hi==2, hi==3, hi==4, hi==5], [x, c, c, x, 0, 0])
+    b = np.select([hi==0, hi==1, hi==2, hi==3, hi==4, hi==5], [0, 0, x, c, c, x])
+
+    return np.clip(r + m, 0, 1), np.clip(g + m, 0, 1), np.clip(b + m, 0, 1)
+
+
 def apply_rim_tint(
     image: Image.Image,
     color_hex: str = '#ffffff',
     strength: float = 0.0,
     brightness_delta: float = 0.0,
 ) -> Image.Image:
-    """Tint a (mostly greyscale) rim image using multiply-blend.
+    """Colorize a rim image: impose chosen hue+saturation while keeping original luminance.
 
-    strength 0.0 = original colours, 1.0 = fully tinted.
-    brightness_delta: -1.0 to +1.0 additive shift on pixel luminance.
+    strength 0.0 = original greyscale, 1.0 = fully colorized.
+    brightness_delta: -1.0 to +1.0 additive shift applied to lightness.
     """
-    img = image.convert('RGBA')
+    if strength <= 0.0 and brightness_delta == 0.0:
+        return image.copy()
 
-    # Parse hex color
-    color_hex = color_hex.lstrip('#')
-    if len(color_hex) == 3:
-        color_hex = ''.join(c * 2 for c in color_hex)
-    cr = int(color_hex[0:2], 16) / 255.0
-    cg = int(color_hex[2:4], 16) / 255.0
-    cb = int(color_hex[4:6], 16) / 255.0
-
-    arr = np.array(img, dtype=np.float32)
-    rgb = arr[..., :3] / 255.0
+    img  = image.convert('RGBA')
+    arr  = np.array(img, dtype=np.float32)
+    rgb  = arr[..., :3] / 255.0
     alpha = arr[..., 3:4]
 
-    # Brightness adjustment (additive on all channels)
-    if brightness_delta != 0.0:
-        rgb = np.clip(rgb + brightness_delta, 0.0, 1.0)
+    # Parse target color → get its hue and saturation in HLS
+    cr, cg, cb = _parse_hex(color_hex)
+    _, _, target_s = _rgb_to_hls_vec(
+        np.array([[[cr]]]), np.array([[[cg]]]), np.array([[[cb]]])
+    )
+    import colorsys
+    target_h, _, _ = colorsys.rgb_to_hls(cr, cg, cb)
+    target_s_val = float(target_s[0, 0, 0])
+
+    # Convert image pixels to HLS
+    h_img, l_img, _ = _rgb_to_hls_vec(rgb[..., 0], rgb[..., 1], rgb[..., 2])
+
+    # Apply brightness delta to lightness
+    l_out = np.clip(l_img + brightness_delta, 0.0, 1.0)
 
     if strength > 0.0:
-        # Luminance of each pixel
-        lum = rgb.mean(axis=-1, keepdims=True)
-        # Multiply-tinted version: preserve shadow/highlight structure
-        tinted = np.stack([lum[..., 0] * cr,
-                           lum[..., 0] * cg,
-                           lum[..., 0] * cb], axis=-1)
-        rgb = rgb * (1.0 - strength) + tinted * strength
+        # Blend: at strength=1 use target_h/target_s, at 0 keep greyscale (s=0)
+        h_out = np.full_like(h_img, target_h)
+        s_out = np.full_like(h_img, target_s_val * strength)
+        # Blend hue only where we're actually adding saturation
+        h_final = h_img * (1.0 - strength) + h_out * strength
+        r_out, g_out, b_out = _hls_to_rgb_vec(h_final, l_out, s_out)
+    else:
+        # brightness only — keep greyscale
+        r_out = g_out = b_out = l_out
 
-    out = np.concatenate([np.clip(rgb * 255, 0, 255), alpha], axis=-1).astype(np.uint8)
+    out = np.stack([r_out, g_out, b_out], axis=-1)
+    out = np.concatenate([np.clip(out * 255, 0, 255), alpha], axis=-1).astype(np.uint8)
     return Image.fromarray(out, 'RGBA')
