@@ -2,7 +2,7 @@
 1320 Legends Car Modder
 Per-part image editing, custom image upload, overlay alignment, and badge editor.
 """
-VERSION = "0.2.8"
+VERSION = "0.2.9"
 import os, sys, shutil, tempfile, threading, math, dataclasses, json, tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk, ImageDraw
@@ -627,7 +627,7 @@ class WheelPreviewWindow(tk.Toplevel):
             self._cv.create_text(sw // 2, sh // 2, text='Load a car first',
                                   fill='#444', font=('Segoe UI', 12))
 
-        # 4. Plate quad (back view only) — outline + draggable corner & centre handles
+        # 4. Plate quad (back view only) — filled quad + corner handles + centre handle
         self._plate_cids.clear()
         self._center_cid = None
         if view == 'b' and self._pvars:
@@ -637,26 +637,40 @@ class WheelPreviewWindow(tk.Toplevel):
                 tx = pv.get('tx', tk.DoubleVar(value=0)).get() * cs
                 ty = pv.get('ty', tk.DoubleVar(value=0)).get() * cs
                 pts_canvas.append((tx, ty))
-            # Draw quad outline (p1-p2-p3-p4 loop)
+
+            # Filled semi-transparent quad (polygon drawn as outline with stipple)
+            flat = [coord for xy in pts_canvas for coord in xy]
+            self._cv.create_polygon(*flat, outline='#ffff00', fill='#ffff00',
+                                     stipple='gray12', width=1)
+            # Solid outline
             for i in range(4):
                 x0, y0 = pts_canvas[i]
                 x1, y1 = pts_canvas[(i+1) % 4]
-                self._cv.create_line(x0, y0, x1, y1, fill='#ffff00', width=1, dash=(4, 3))
-            # Draw corner handles
-            r = 8
+                self._cv.create_line(x0, y0, x1, y1, fill='#ffff00', width=2)
+
+            # Corner handles with coordinate tooltip
+            r = 9
             for pt, (cx, cy) in zip(('p1','p2','p3','p4'), pts_canvas):
-                col = self.PLATE_COLORS[pt]
-                oid = self._cv.create_oval(cx-r, cy-r, cx+r, cy+r,
-                                            outline=col, fill=BG, width=2)
-                tid = self._cv.create_text(cx, cy, text=pt, fill=col,
-                                            font=('Segoe UI', 6, 'bold'))
+                col  = self.PLATE_COLORS[pt]
+                pv   = self._pvars.get(pt, {})
+                gx   = round(pv.get('tx', tk.DoubleVar()).get())
+                gy   = round(pv.get('ty', tk.DoubleVar()).get())
+                oid  = self._cv.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                             outline=col, fill='#222244', width=2)
+                tid  = self._cv.create_text(cx, cy, text=pt, fill=col,
+                                             font=('Segoe UI', 6, 'bold'))
+                # small coord label below handle
+                self._cv.create_text(cx, cy + r + 7,
+                                      text=f'{gx},{gy}', fill=col,
+                                      font=('Consolas', 6))
                 self._plate_cids[pt] = (oid, tid)
-            # Draw centre handle (crosshair circle) — moves all corners together
+
+            # Centre crosshair handle — drag to move whole plate
             mx = sum(x for x, y in pts_canvas) / 4
             my = sum(y for x, y in pts_canvas) / 4
-            cr = 10
+            cr = 11
             cid_o = self._cv.create_oval(mx-cr, my-cr, mx+cr, my+cr,
-                                          outline='#ffffff', fill='#333333', width=2)
+                                          outline='#ffffff', fill='#333355', width=2)
             cid_h = self._cv.create_line(mx-cr, my, mx+cr, my, fill='#ffffff', width=1)
             cid_v = self._cv.create_line(mx, my-cr, mx, my+cr, fill='#ffffff', width=1)
             self._center_cid = (cid_o, cid_h, cid_v, mx, my)
@@ -4760,24 +4774,17 @@ class CarModderApp(tk.Tk):
                             generated.append(dst)
                             continue
 
-                    # Plate corner SWFs (p1-p4)
+                    # Plate corner SWFs (p1-p4) — always write current values
                     plate_match = f in ('p1.swf', 'p2.swf', 'p3.swf', 'p4.swf')
                     if plate_match:
                         pt_key = f[:-4]  # 'p1','p2','p3','p4'
                         pv = self._plate_vars.get(pt_key, {})
                         if pv:
-                            src_vals = self._plate_src.get(pt_key, {})
-                            overrides = {}
-                            for vn, dv in pv.items():
-                                new_v = round(dv.get(), 2)
-                                old_v = round(float(src_vals.get(vn, new_v)), 2)
-                                if new_v != old_v:
-                                    overrides[vn] = new_v
-                            if overrides:
-                                log(f"Patching plate {pt_key} in {view.upper()}: {overrides}")
-                                patch_tire_swf(fp, dst, overrides)
-                                generated.append(dst)
-                                continue
+                            overrides = {vn: round(dv.get(), 2) for vn, dv in pv.items()}
+                            log(f"Writing plate {pt_key}: {overrides}")
+                            patch_tire_swf(fp, dst, overrides)
+                            generated.append(dst)
+                            continue
 
                     if not os.path.exists(dst):
                         shutil.copy2(fp, dst)

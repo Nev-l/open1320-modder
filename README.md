@@ -9,6 +9,10 @@ Car modding tools for Nitto Legends (open1320 / nittolol clients).
 
 ## Changelog
 
+### v0.2.9
+- Fixed plate coordinates never saving: build now always writes current tx/ty to p1-p4 SWFs instead of skipping when "unchanged" (the old diff check against `_plate_src` was always zero when source had no plate files)
+- Plate quad on canvas now shows as a semi-transparent filled polygon with a solid yellow outline, coordinate labels on each corner handle, and a centre crosshair handle — makes it much easier to see where the plate sits on the car
+
 ### v0.2.8
 - Wheel/plate aligner rebuilt: all controls now in a panel **above** the canvas (no side panel that collapses)
 - Added **plate centre-point drag handle** (⊕) — drag it to move all 4 plate corners together
