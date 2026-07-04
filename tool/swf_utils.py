@@ -110,12 +110,119 @@ def export_swf_frame(swf_path: str, out_dir: str) -> "str | None":
     return None
 
 
+def read_swf_bitmaps(swf_path: str) -> list[Image.Image]:
+    """Extract all bitmap images from a SWF without FFDec.
+    Handles DefineBitsJPEG2 (21), DefineBitsJPEG3 (35), DefineBitsJPEG4 (90),
+    DefineBitsLossless (20), DefineBitsLossless2 (36).
+    Returns PIL Images sorted largest-first."""
+    import io
+    data = open(swf_path, 'rb').read()
+    sig = data[:3]
+    if sig == b'CWS':
+        body = zlib.decompress(data[8:])
+    elif sig == b'ZWS':
+        import lzma
+        body = lzma.decompress(data[12:])
+    elif sig == b'FWS':
+        body = data[8:]
+    else:
+        return []
+
+    nb = (body[0] >> 3) & 0x1f
+    i  = ((5 + nb * 4 + 7) // 8) + 4
+
+    images = []
+    while i < len(body) - 2:
+        rec      = struct.unpack_from('<H', body, i)[0]
+        tag_type = rec >> 6
+        tag_len  = rec & 0x3f
+        i += 2
+        if tag_len == 0x3f:
+            tag_len = struct.unpack_from('<i', body, i)[0]
+            i += 4
+        if tag_type == 0:
+            break
+
+        chunk = body[i:i + tag_len]
+
+        try:
+            if tag_type in (21, 19) and tag_len > 2:
+                # DefineBitsJPEG2/DefineBits — raw JPEG after CharacterID
+                img = Image.open(io.BytesIO(chunk[2:])).convert('RGBA')
+                images.append(img)
+
+            elif tag_type == 35 and tag_len > 6:
+                # DefineBitsJPEG3 — JPEG + zlib alpha channel
+                alpha_off = struct.unpack_from('<I', chunk, 2)[0]
+                jpeg_data = chunk[6:6 + alpha_off]
+                alpha_raw = chunk[6 + alpha_off:]
+                img = Image.open(io.BytesIO(jpeg_data)).convert('RGBA')
+                try:
+                    alpha_bytes = zlib.decompress(alpha_raw)
+                    w, h = img.size
+                    if len(alpha_bytes) >= w * h:
+                        alpha_ch = Image.frombytes('L', (w, h), alpha_bytes[:w * h])
+                        img.putalpha(alpha_ch)
+                except Exception:
+                    pass
+                images.append(img)
+
+            elif tag_type == 90 and tag_len > 8:
+                # DefineBitsJPEG4 — same as JPEG3 but with extra deblock UI16
+                alpha_off = struct.unpack_from('<I', chunk, 2)[0]
+                jpeg_data = chunk[8:8 + alpha_off]
+                alpha_raw = chunk[8 + alpha_off:]
+                img = Image.open(io.BytesIO(jpeg_data)).convert('RGBA')
+                try:
+                    alpha_bytes = zlib.decompress(alpha_raw)
+                    w, h = img.size
+                    if len(alpha_bytes) >= w * h:
+                        alpha_ch = Image.frombytes('L', (w, h), alpha_bytes[:w * h])
+                        img.putalpha(alpha_ch)
+                except Exception:
+                    pass
+                images.append(img)
+
+            elif tag_type in (20, 36) and tag_len >= 7:
+                # DefineBitsLossless / DefineBitsLossless2
+                fmt     = chunk[2]
+                w       = struct.unpack_from('<H', chunk, 3)[0]
+                h       = struct.unpack_from('<H', chunk, 5)[0]
+                hdr_end = 7 + (1 if fmt == 3 else 0)
+                raw     = zlib.decompress(chunk[hdr_end:])
+                if fmt == 5 and len(raw) >= w * h * 4:
+                    arr = bytearray(raw[:w * h * 4])
+                    for p in range(0, len(arr), 4):
+                        arr[p], arr[p+1], arr[p+2], arr[p+3] = \
+                            arr[p+1], arr[p+2], arr[p+3], arr[p]
+                    images.append(Image.frombytes('RGBA', (w, h), bytes(arr)))
+                elif fmt == 3 and len(raw) >= w * h:
+                    images.append(Image.frombytes('P', (w, h),
+                                                  raw[:w * h]).convert('RGBA'))
+        except Exception:
+            pass
+
+        i += tag_len
+
+    images.sort(key=lambda im: im.width * im.height, reverse=True)
+    return images
+
+
 def export_image(swf_path: str, out_dir: str) -> str | None:
-    """Export the largest embedded image from a SWF. Returns file path or None."""
+    """Export the largest embedded image from a SWF. Returns file path or None.
+    Tries FFDec first; falls back to direct DefineBitsLossless2 parsing."""
     images = export_all_images(swf_path, out_dir)
-    if not images:
+    if images:
+        return max(images.values(), key=lambda p: os.path.getsize(p))
+
+    # FFDec found nothing — try direct bitmap extraction
+    bitmaps = read_swf_bitmaps(swf_path)
+    if not bitmaps:
         return None
-    return max(images.values(), key=lambda p: os.path.getsize(p))
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, 'direct_0.png')
+    bitmaps[0].save(out_path, 'PNG')
+    return out_path
 
 
 def export_all_images(swf_path: str, out_dir: str) -> dict[int, str]:
