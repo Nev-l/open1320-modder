@@ -2,7 +2,7 @@
 1320 Legends Car Modder
 Per-part image editing, custom image upload, overlay alignment, and badge editor.
 """
-VERSION = "0.0.1"
+VERSION = "0.2.8"
 import os, sys, shutil, tempfile, threading, math, dataclasses, json, tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk, ImageDraw
@@ -209,245 +209,243 @@ class ImageSlot:
 # ── Wheel position preview window ─────────────────────────────────────────────
 
 class WheelPreviewWindow(tk.Toplevel):
-    """Visual wheel position editor with real tire/wheel image overlays."""
+    """Visual wheel + plate aligner — drag handles to reposition."""
 
     STAGE_W, STAGE_H = 640, 400
-    CANVAS_SCALE = 1.1          # visual scale — game coords stay 640×400
-    HANDLE_R   = 12
-    HANDLE_HIT = 20
-    TIRE_COLORS = {'F': '#00d4ff', 'R': '#ff6b6b', 'Back': '#00ff88'}
+    CANVAS_SCALE     = 1.1
+    HANDLE_R         = 12
+    HANDLE_HIT       = 20
+    TIRE_COLORS      = {'F': '#00d4ff', 'R': '#ff6b6b', 'Back': '#00ff88'}
+    PLATE_COLORS     = {'p1': '#ffaa00', 'p2': '#ff44cc', 'p3': '#44ffcc', 'p4': '#aaaaff'}
 
-    def __init__(self, parent, slots: list, wheel_vars: dict,
-                 wheel_src: dict, pkg_info: dict, car_id: int, tmp_dir: str,
-                 plate_vars: dict = None, plate_src: dict = None):
+    def __init__(self, parent, slots, wheel_vars, wheel_src,
+                 pkg_info, car_id, tmp_dir,
+                 plate_vars=None, plate_src=None):
         super().__init__(parent, bg=BG)
-        self.title("Wheel & Plate Aligner — drag circles to reposition")
-        self.resizable(False, False)
-        self._slots     = slots
-        self._wvars     = wheel_vars   # {(view,tire): {tx,ty}: DoubleVar}
-        self._wsrc      = wheel_src    # {(view,tire): {tx,ty,scx,scy}: raw values
-        self._pvars     = plate_vars or {}   # {p1..p4: {tx,ty}: DoubleVar}
-        self._psrc      = plate_src  or {}   # {p1..p4: {tx,ty,...}: raw values
-        self._pkg_info  = pkg_info
-        self._car_id    = car_id
-        self._tmp_dir   = tmp_dir
-        self._view      = tk.StringVar(value='f')
-        self._drag        = None         # tire being dragged ('F','R','Back') or None
-        self._drag_plate  = None         # plate corner being dragged ('p1'..'p4') or None
-        self._tk_img    = None
-        self._tk_bg     = None
-        self._tk_ovls   = []           # keep PhotoImage refs alive
-        self._cids      = {}
+        self.title("Wheel & Plate Aligner")
+        self._slots    = slots
+        self._wvars    = wheel_vars
+        self._wsrc     = wheel_src
+        self._pvars    = plate_vars or {}
+        self._psrc     = plate_src  or {}
+        self._pkg_info = pkg_info
+        self._car_id   = car_id
+        self._tmp_dir  = tmp_dir
+
+        self._view       = tk.StringVar(value='f')
+        self._drag       = None        # tire key or None
+        self._drag_plate = None        # 'p1'..'p4' / 'center' / None
+        self._drag_last  = None        # (x, y) for centre-drag delta
+        self._tk_img     = None
+        self._tk_bg      = None
+        self._tk_ovls    = []
+        self._cids       = {}
         self._plate_cids = {}          # pt -> (oval_id, text_id)
-        self._body_off  = {}           # view -> (xmin, ymin) from body SWF RECT
-        self._body_size = {}           # view -> (width_px, height_px) from body SWF RECT
-        self._overlays  = {}           # (view,layer,tire) -> PIL.Image
+        self._center_cid = None        # canvas item id for plate centre handle
+        self._overlays   = {}
         self._loading    = False
+
         self._tire_id    = tk.IntVar(value=1)
         self._wheel_id   = tk.IntVar(value=1)
         self._show_tire  = tk.BooleanVar(value=True)
         self._show_wheel = tk.BooleanVar(value=True)
-        # Per-position visibility: each can be toggled independently
-        self._show_pos   = {
-            'F':    tk.BooleanVar(value=True),
-            'R':    tk.BooleanVar(value=True),
-            'Back': tk.BooleanVar(value=True),
-        }
-        self._ov_status  = tk.StringVar(value='Click "Load" to show tire/wheel images')
+        self._show_pos   = {k: tk.BooleanVar(value=True)
+                            for k in ('F', 'R', 'Back')}
+        self._ov_status  = tk.StringVar(value='Click LOAD to show tire/wheel images')
 
         self._build_ui()
-        # Force window open wide enough to show canvas + right control panel
-        cw = int(self.STAGE_W * self.CANVAS_SCALE)
-        ch = int(self.STAGE_H * self.CANVAS_SCALE)
-        self.minsize(cw + 360, ch + 120)
-        self.geometry(f'{cw + 380}x{ch + 160}')
         self._render()
 
-    # ── Setup ─────────────────────────────────────────────────────────────────
-
-    # ── UI ────────────────────────────────────────────────────────────────────
+    # ── Build UI ──────────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        """
+        Layout (top → bottom):
+          Row 0 — load/view bar
+          Row 1 — wheel controls   (left pane, pack) | plate controls (right pane, pack)
+          Row 2 — canvas
+          Row 3 — footer / status bar
+        All rows are full-width so there is NO side-panel that can collapse.
+        """
         self.resizable(True, True)
-        # Use grid on the Toplevel so every row is always visible
+        cs = self.CANVAS_SCALE
+        cw = int(self.STAGE_W * cs)
+        ch = int(self.STAGE_H * cs)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)   # canvas row expands
+        self.rowconfigure(2, weight=1)   # canvas row grows if window is resized
 
-        # ── ROW 0: Load Tires / Rims bar ─────────────────────────────────────
-        load_fr = ttk.LabelFrame(self, text="Load Tires / Rims", padding=8)
+        # ── ROW 0: load bar ───────────────────────────────────────────────────
+        load_fr = ttk.LabelFrame(self, text="Load Tires / Rims", padding=6)
         load_fr.grid(row=0, column=0, sticky='ew', padx=8, pady=(8, 4))
 
-        ttk.Label(load_fr, text="Tire ID (1-7):").grid(row=0, column=0, sticky='w')
+        ttk.Label(load_fr, text="Tire ID:").pack(side='left')
         ttk.Spinbox(load_fr, textvariable=self._tire_id, from_=1, to=7,
-                    width=5).grid(row=0, column=1, sticky='w', padx=(4, 16))
-
-        ttk.Label(load_fr, text="Rim ID (1-157):").grid(row=0, column=2, sticky='w')
+                    width=4).pack(side='left', padx=(2, 10))
+        ttk.Label(load_fr, text="Rim ID:").pack(side='left')
         ttk.Spinbox(load_fr, textvariable=self._wheel_id, from_=1, to=157,
-                    width=5).grid(row=0, column=3, sticky='w', padx=(4, 16))
-
-        ttk.Checkbutton(load_fr, text="Show Tires",
+                    width=5).pack(side='left', padx=(2, 10))
+        ttk.Checkbutton(load_fr, text="Tires",
                         variable=self._show_tire,
-                        command=self._render).grid(row=0, column=4, padx=(0, 8))
-        ttk.Checkbutton(load_fr, text="Show Rims",
+                        command=self._render).pack(side='left', padx=(0, 4))
+        ttk.Checkbutton(load_fr, text="Rims",
                         variable=self._show_wheel,
-                        command=self._render).grid(row=0, column=5, padx=(0, 16))
-
-        ttk.Button(load_fr, text="LOAD", width=10, style="Accent.TButton",
-                   command=self._load_overlays).grid(row=0, column=6, padx=(0, 4))
-
-        ttk.Label(load_fr, textvariable=self._ov_status,
-                  foreground='#aaa', font=('Segoe UI', 8),
-                  width=40).grid(row=0, column=7, sticky='w', padx=(8, 0))
-
-        # View toggle
-        view_fr = ttk.Frame(load_fr)
-        view_fr.grid(row=1, column=0, columnspan=8, sticky='w', pady=(6, 0))
-        ttk.Label(view_fr, text="View:").pack(side='left', padx=(0, 4))
+                        command=self._render).pack(side='left', padx=(0, 10))
+        ttk.Button(load_fr, text="LOAD", style="Accent.TButton",
+                   command=self._load_overlays).pack(side='left', padx=(0, 10))
+        ttk.Label(load_fr, text="View:").pack(side='left')
         for v, t in [('f', 'Front'), ('b', 'Back')]:
-            ttk.Radiobutton(view_fr, text=t, value=v, variable=self._view,
-                            command=self._on_view_change).pack(side='left', padx=(0, 8))
+            ttk.Radiobutton(load_fr, text=t, value=v, variable=self._view,
+                            command=self._on_view_change).pack(side='left', padx=(4, 0))
+        ttk.Label(load_fr, textvariable=self._ov_status,
+                  foreground='#aaa', font=('Segoe UI', 8)).pack(side='left', padx=(16, 0))
 
-        # ── ROW 1: canvas (left) + position table (right) ────────────────────
-        mid = tk.Frame(self, bg=BG)
-        mid.grid(row=1, column=0, sticky='nsew', padx=8, pady=4)
-        mid.columnconfigure(0, weight=0)   # canvas: fixed
-        mid.columnconfigure(1, weight=1, minsize=320)   # controls: at least 320px
-        mid.rowconfigure(0, weight=1)
-
-        cs = self.CANVAS_SCALE
-        self._cv = tk.Canvas(mid, width=int(self.STAGE_W * cs), height=int(self.STAGE_H * cs),
-                             bg=DARK, highlightthickness=0, cursor='crosshair')
-        self._cv.grid(row=0, column=0, sticky='nw')
-        self._cv.bind('<ButtonPress-1>',   self._on_press)
-        self._cv.bind('<B1-Motion>',       self._on_drag)
-        self._cv.bind('<ButtonRelease-1>', self._on_release)
-        self._cv.bind('<Left>',  lambda e: self._nudge(-1,  0))
-        self._cv.bind('<Right>', lambda e: self._nudge( 1,  0))
-        self._cv.bind('<Up>',    lambda e: self._nudge( 0, -1))
-        self._cv.bind('<Down>',  lambda e: self._nudge( 0,  1))
-        self._cv.bind('<shift-Left>',  lambda e: self._nudge(-10,   0))
-        self._cv.bind('<shift-Right>', lambda e: self._nudge( 10,   0))
-        self._cv.bind('<shift-Up>',    lambda e: self._nudge(  0, -10))
-        self._cv.bind('<shift-Down>',  lambda e: self._nudge(  0,  10))
-        self._cv.config(takefocus=True)
-
-        # Right panel — Notebook with Wheels tab + Plate tab
-        # width=320 + grid_propagate(False) ensures it never collapses to zero
-        right = tk.Frame(mid, bg=BG, width=320)
-        right.grid(row=0, column=1, sticky='nsew', padx=(10, 0))
-        right.grid_propagate(False)
-
-        nb = ttk.Notebook(right)
-        nb.pack(fill='both', expand=True)
-
-        wheels_tab = tk.Frame(nb, bg=BG)
-        plate_tab  = tk.Frame(nb, bg=BG)
-        nb.add(wheels_tab, text='Wheels')
-        nb.add(plate_tab,  text='Plate')
-
-        pos_lf = ttk.LabelFrame(wheels_tab, text="Wheel Positions & Size", padding=(8, 4))
-        pos_lf.pack(fill='both', expand=True)
-
-        # Visibility toggles
-        vis_fr = ttk.Frame(pos_lf)
-        vis_fr.grid(row=0, column=0, columnspan=6, sticky='w', pady=(0, 4))
-        ttk.Label(vis_fr, text='Show:', foreground='#888',
-                  font=('Segoe UI', 7)).pack(side='left', padx=(0, 4))
-        self._pos_chks = {}
-        for tire, label in [('F', 'Front'), ('R', 'Rear'), ('Back', 'Race-rear')]:
-            ck = ttk.Checkbutton(vis_fr, text=label,
-                                 variable=self._show_pos[tire], command=self._render)
-            ck.pack(side='left', padx=(0, 6))
-            self._pos_chks[tire] = ck
+        # ── ROW 1: control panel (full width) ────────────────────────────────
+        ctrl_outer = tk.Frame(self, bg=BG)
+        ctrl_outer.grid(row=1, column=0, sticky='ew', padx=8, pady=(0, 4))
 
         def _spin(parent, dv, lo, hi, w=5):
             sp = tk.Spinbox(parent, textvariable=dv, from_=lo, to=hi, increment=1,
-                            width=w, bg="#16213e", fg=ACC, buttonbackground="#0f3460",
-                            relief="flat", font=("Consolas", 8))
+                            width=w, bg=MID, fg=ACC, buttonbackground='#0f3460',
+                            relief='flat', font=('Consolas', 9))
             dv.trace_add('write', lambda *_: self.after(0, self._render))
             return sp
 
-        def _wheel_block(parent_row, view):
-            vu = view.upper()
-            # Section divider
-            sep_fr = ttk.Frame(pos_lf)
-            sep_fr.grid(row=parent_row, column=0, columnspan=2, sticky='ew', pady=(6, 2))
-            ttk.Label(sep_fr, text=f'— {vu} View —', foreground='#555',
-                      font=('Segoe UI', 7, 'bold')).pack(side='left')
+        def _lbl(parent, text, fg=None, font=None):
+            kw = dict(bg=BG, text=text)
+            if fg:   kw['fg']   = fg
+            if font: kw['font'] = font
+            return tk.Label(parent, **kw)
 
-            tires = [('F', 'Front wheel'), ('R', 'Rear wheel')]
-            if view == 'b':
-                tires.append(('Back', 'Race rear'))
+        # ── LEFT PANE: wheel positions + size ────────────────────────────────
+        wh_lf = ttk.LabelFrame(ctrl_outer, text="Wheel Positions & Size", padding=6)
+        wh_lf.pack(side='left', fill='both', expand=True, padx=(0, 6))
 
-            r = parent_row + 1
-            for tire, lbl in tires:
+        # visibility toggles row
+        vis_fr = tk.Frame(wh_lf, bg=BG)
+        vis_fr.pack(anchor='w', pady=(0, 4))
+        _lbl(vis_fr, 'Show:', fg='#888', font=('Segoe UI', 7)).pack(side='left', padx=(0, 4))
+        for k, lbl in [('F', 'Front'), ('R', 'Rear'), ('Back', 'Race-rear')]:
+            ttk.Checkbutton(vis_fr, text=lbl,
+                            variable=self._show_pos[k],
+                            command=self._render).pack(side='left', padx=(0, 8))
+
+        # each view's wheels in a horizontal strip
+        for view, tires in [('f', [('F', 'Frnt'), ('R', 'Rear')]),
+                             ('b', [('F', 'Frnt'), ('R', 'Rear'), ('Back', 'Race')])]:
+            strip = tk.Frame(wh_lf, bg=BG)
+            strip.pack(anchor='w', fill='x', pady=(2, 0))
+            _lbl(strip, f'{view.upper()} View:', fg='#555',
+                 font=('Segoe UI', 7, 'bold')).pack(side='left', padx=(0, 8))
+
+            for tire, short in tires:
                 wkey  = (view, tire)
-                vars_ = self._wvars.get(wkey, {vn: tk.DoubleVar(
-                    value=100 if vn in ('scx','scy') else 0)
-                    for vn in ('tx','ty','scx','scy')})
+                defv  = {vn: tk.DoubleVar(value=100 if vn in ('scx','scy') else 0)
+                         for vn in ('tx','ty','scx','scy')}
+                vars_ = self._wvars.get(wkey, defv)
 
-                # Row A: ● label   X:[  ]  Y:[  ]
-                row_a = ttk.Frame(pos_lf)
-                row_a.grid(row=r, column=0, columnspan=2, sticky='w', pady=(3, 0))
-                tk.Label(row_a, text='●', fg=self.TIRE_COLORS[tire],
-                         bg=BG, font=('Segoe UI', 9)).pack(side='left')
-                ttk.Label(row_a, text=lbl, font=('Segoe UI', 8),
-                          width=11).pack(side='left', padx=(2, 6))
-                ttk.Label(row_a, text='X:').pack(side='left')
-                _spin(row_a, vars_['tx'], -9999, 9999, 6).pack(side='left', padx=(2, 6))
-                ttk.Label(row_a, text='Y:').pack(side='left')
-                _spin(row_a, vars_['ty'], -9999, 9999, 6).pack(side='left', padx=(2, 0))
+                cell = tk.Frame(strip, bg='#16213e', relief='flat', bd=1)
+                cell.pack(side='left', padx=(0, 6), pady=2, ipadx=4, ipady=3)
 
-                # Row B: (indent)   W%:[  ]  H%:[  ]
-                row_b = ttk.Frame(pos_lf)
-                row_b.grid(row=r+1, column=0, columnspan=2, sticky='w', pady=(1, 2))
-                ttk.Label(row_b, text='',
-                          width=13).pack(side='left')   # indent to match label above
-                ttk.Label(row_b, text='W%:', foreground='#888',
-                          font=('Segoe UI', 7)).pack(side='left')
-                _spin(row_b, vars_['scx'], 1, 500, 6).pack(side='left', padx=(2, 6))
-                ttk.Label(row_b, text='H%:', foreground='#888',
-                          font=('Segoe UI', 7)).pack(side='left')
-                _spin(row_b, vars_['scy'], 1, 500, 6).pack(side='left', padx=(2, 0))
+                hdr = tk.Frame(cell, bg='#16213e')
+                hdr.pack(anchor='w')
+                tk.Label(hdr, text='●', bg='#16213e', fg=self.TIRE_COLORS[tire],
+                         font=('Segoe UI', 9)).pack(side='left')
+                tk.Label(hdr, text=short, bg='#16213e', fg=FG,
+                         font=('Segoe UI', 8, 'bold')).pack(side='left', padx=(2, 0))
 
-                r += 2
+                xy_row = tk.Frame(cell, bg='#16213e')
+                xy_row.pack(anchor='w')
+                tk.Label(xy_row, text='X:', bg='#16213e', fg='#aaa',
+                         font=('Segoe UI', 7)).pack(side='left')
+                _spin(xy_row, vars_['tx'], -9999, 9999, 5).pack(side='left', padx=(1, 4))
+                tk.Label(xy_row, text='Y:', bg='#16213e', fg='#aaa',
+                         font=('Segoe UI', 7)).pack(side='left')
+                _spin(xy_row, vars_['ty'], -9999, 9999, 5).pack(side='left', padx=(1, 0))
 
-        _wheel_block(1, 'f')
-        _wheel_block(8, 'b')
+                sz_row = tk.Frame(cell, bg='#16213e')
+                sz_row.pack(anchor='w')
+                tk.Label(sz_row, text='W%:', bg='#16213e', fg='#666',
+                         font=('Segoe UI', 7)).pack(side='left')
+                _spin(sz_row, vars_['scx'], 1, 500, 5).pack(side='left', padx=(1, 4))
+                tk.Label(sz_row, text='H%:', bg='#16213e', fg='#666',
+                         font=('Segoe UI', 7)).pack(side='left')
+                _spin(sz_row, vars_['scy'], 1, 500, 5).pack(side='left', padx=(1, 0))
 
-        # ── Plate corner points ───────────────────────────────────────────────
-        plate_lf = ttk.LabelFrame(plate_tab, text="Plate Position (Back View)", padding=(8, 4))
-        plate_lf.pack(fill='both', expand=True, pady=(4, 0))
+        # ── RIGHT PANE: plate corners ─────────────────────────────────────────
+        pl_lf = ttk.LabelFrame(ctrl_outer, text="Plate Corners (Back view)", padding=6)
+        pl_lf.pack(side='right', fill='y', padx=(0, 0))
 
-        ttk.Label(plate_lf, text="p1=BL  p2=BR  p3=TR  p4=TL", foreground='#555',
-                  font=('Segoe UI', 7)).grid(row=0, column=0, columnspan=4, sticky='w')
+        tk.Label(pl_lf, text='Drag ⊕ centre  or individual corners',
+                 bg=BG, fg='#555', font=('Segoe UI', 7)).pack(anchor='w', pady=(0, 4))
 
-        PLATE_COLORS = {'p1': '#ffaa00', 'p2': '#ff44cc', 'p3': '#44ffcc', 'p4': '#aaaaff'}
-        for pi, pt in enumerate(('p1','p2','p3','p4')):
-            pv = self._pvars.get(pt, {})
-            row_fr = ttk.Frame(plate_lf)
-            row_fr.grid(row=pi+1, column=0, columnspan=4, sticky='w', pady=(2,0))
-            tk.Label(row_fr, text='●', fg=PLATE_COLORS[pt],
-                     bg=BG, font=('Segoe UI', 9)).pack(side='left')
-            ttk.Label(row_fr, text=pt, font=('Segoe UI', 8), width=3).pack(side='left', padx=(2,6))
-            ttk.Label(row_fr, text='X:').pack(side='left')
-            tx_dv = pv.get('tx', tk.DoubleVar(value=0))
-            ty_dv = pv.get('ty', tk.DoubleVar(value=0))
-            _spin(row_fr, tx_dv, -9999, 9999, 6).pack(side='left', padx=(2, 6))
-            ttk.Label(row_fr, text='Y:').pack(side='left')
-            _spin(row_fr, ty_dv, -9999, 9999, 6).pack(side='left', padx=(2, 0))
+        plate_grid = tk.Frame(pl_lf, bg=BG)
+        plate_grid.pack(anchor='w')
 
-        # ── ROW 2: coord readout + Close ─────────────────────────────────────
-        foot = ttk.Frame(self, padding=(8, 0, 8, 8))
-        foot.grid(row=2, column=0, sticky='ew')
-        self._coord_lbl = ttk.Label(
-            foot,
-            text='Drag circles to move wheels/plate corners  |  Arrow keys = 1px nudge  |  Shift+Arrow = 10px  |  Switch to Back view for plate',
-            foreground='#555', font=('Segoe UI', 8))
-        self._coord_lbl.pack(side='left')
-        ttk.Button(foot, text='Close', command=self.destroy).pack(side='right')
+        for row_i, (pt_row) in enumerate([('p4', 'p3'), ('p1', 'p2')]):
+            for col_i, pt in enumerate(pt_row):
+                pv   = self._pvars.get(pt, {})
+                tx_v = pv.get('tx', tk.DoubleVar(value=0))
+                ty_v = pv.get('ty', tk.DoubleVar(value=0))
+                tx_v.trace_add('write', lambda *_: self.after(0, self._render))
+                ty_v.trace_add('write', lambda *_: self.after(0, self._render))
+
+                cell = tk.Frame(plate_grid, bg='#16213e', bd=1, relief='flat')
+                cell.grid(row=row_i, column=col_i, padx=3, pady=3, ipadx=4, ipady=3)
+
+                hdr = tk.Frame(cell, bg='#16213e')
+                hdr.pack(anchor='w')
+                tk.Label(hdr, text='●', bg='#16213e', fg=self.PLATE_COLORS[pt],
+                         font=('Segoe UI', 9)).pack(side='left')
+                tk.Label(hdr, text=pt, bg='#16213e', fg=FG,
+                         font=('Segoe UI', 8, 'bold')).pack(side='left', padx=(2, 0))
+
+                xy = tk.Frame(cell, bg='#16213e')
+                xy.pack(anchor='w')
+                tk.Label(xy, text='X:', bg='#16213e', fg='#aaa',
+                         font=('Segoe UI', 7)).pack(side='left')
+                _spin(xy, tx_v, -9999, 9999, 5).pack(side='left', padx=(1, 4))
+                tk.Label(xy, text='Y:', bg='#16213e', fg='#aaa',
+                         font=('Segoe UI', 7)).pack(side='left')
+                _spin(xy, ty_v, -9999, 9999, 5).pack(side='left', padx=(1, 0))
+
+        # ── ROW 2: canvas ─────────────────────────────────────────────────────
+        canvas_wrapper = tk.Frame(self, bg='#333')
+        canvas_wrapper.grid(row=2, column=0, sticky='nw', padx=8, pady=(0, 4))
+
+        self._cv = tk.Canvas(canvas_wrapper, width=cw, height=ch,
+                             bg=DARK, highlightthickness=0, cursor='crosshair')
+        self._cv.pack()
+        self._cv.bind('<ButtonPress-1>',   self._on_press)
+        self._cv.bind('<B1-Motion>',       self._on_drag)
+        self._cv.bind('<ButtonRelease-1>', self._on_release)
+        self._cv.bind('<Left>',            lambda e: self._nudge(-1,  0))
+        self._cv.bind('<Right>',           lambda e: self._nudge( 1,  0))
+        self._cv.bind('<Up>',              lambda e: self._nudge( 0, -1))
+        self._cv.bind('<Down>',            lambda e: self._nudge( 0,  1))
+        self._cv.bind('<Shift-Left>',      lambda e: self._nudge(-10,  0))
+        self._cv.bind('<Shift-Right>',     lambda e: self._nudge( 10,  0))
+        self._cv.bind('<Shift-Up>',        lambda e: self._nudge(  0,-10))
+        self._cv.bind('<Shift-Down>',      lambda e: self._nudge(  0, 10))
+        self._cv.config(takefocus=True)
+
+        # ── ROW 3: footer / status ─────────────────────────────────────────────
+        foot = tk.Frame(self, bg=BG)
+        foot.grid(row=3, column=0, sticky='ew', padx=8, pady=(0, 8))
+        ttk.Button(foot, text='Close',
+                   command=self.destroy).pack(side='right')
         ttk.Button(foot, text='Reset Positions',
                    command=self._reset_positions).pack(side='right', padx=(0, 6))
+        self._coord_lbl = tk.Label(
+            foot, bg=BG, fg='#555', font=('Segoe UI', 8), anchor='w',
+            text='Click canvas then use Arrow keys (1px) or Shift+Arrow (10px) | '
+                 'Drag coloured circles | Switch to Back view for plate')
+        self._coord_lbl.pack(side='left')
+
+        # Size the window: controls (≈160px) + canvas + load bar + footer + padding
+        win_w = max(cw + 24, 1100)
+        win_h = ch + 260
+        self.minsize(cw + 24, ch + 240)
+        self.geometry(f'{win_w}x{win_h}')
 
     # ── Overlay loading ────────────────────────────────────────────────────────
 
@@ -629,10 +627,10 @@ class WheelPreviewWindow(tk.Toplevel):
             self._cv.create_text(sw // 2, sh // 2, text='Load a car first',
                                   fill='#444', font=('Segoe UI', 12))
 
-        # 4. Plate quad (back view only) — outline + draggable corner handles
+        # 4. Plate quad (back view only) — outline + draggable corner & centre handles
         self._plate_cids.clear()
+        self._center_cid = None
         if view == 'b' and self._pvars:
-            PLATE_COLORS = {'p1': '#ffaa00', 'p2': '#ff44cc', 'p3': '#44ffcc', 'p4': '#aaaaff'}
             pts_canvas = []
             for pt in ('p1', 'p2', 'p3', 'p4'):
                 pv = self._pvars.get(pt, {})
@@ -644,15 +642,24 @@ class WheelPreviewWindow(tk.Toplevel):
                 x0, y0 = pts_canvas[i]
                 x1, y1 = pts_canvas[(i+1) % 4]
                 self._cv.create_line(x0, y0, x1, y1, fill='#ffff00', width=1, dash=(4, 3))
-            # Draw corner handles — store IDs for smooth drag
+            # Draw corner handles
             r = 8
             for pt, (cx, cy) in zip(('p1','p2','p3','p4'), pts_canvas):
-                col = PLATE_COLORS[pt]
+                col = self.PLATE_COLORS[pt]
                 oid = self._cv.create_oval(cx-r, cy-r, cx+r, cy+r,
                                             outline=col, fill=BG, width=2)
                 tid = self._cv.create_text(cx, cy, text=pt, fill=col,
                                             font=('Segoe UI', 6, 'bold'))
                 self._plate_cids[pt] = (oid, tid)
+            # Draw centre handle (crosshair circle) — moves all corners together
+            mx = sum(x for x, y in pts_canvas) / 4
+            my = sum(y for x, y in pts_canvas) / 4
+            cr = 10
+            cid_o = self._cv.create_oval(mx-cr, my-cr, mx+cr, my+cr,
+                                          outline='#ffffff', fill='#333333', width=2)
+            cid_h = self._cv.create_line(mx-cr, my, mx+cr, my, fill='#ffffff', width=1)
+            cid_v = self._cv.create_line(mx, my-cr, mx, my+cr, fill='#ffffff', width=1)
+            self._center_cid = (cid_o, cid_h, cid_v, mx, my)
 
         # 3. Draggable circles — only for visible positions
         tires_for_view = ['F', 'R'] + (['Back'] if view == 'b' else [])
@@ -692,10 +699,16 @@ class WheelPreviewWindow(tk.Toplevel):
         return None
 
     def _hit_plate(self, x, y):
-        """Return plate corner key ('p1'..'p4') if (x,y) hits one, else None."""
+        """Return 'center', 'p1'..'p4', or None."""
         if self._view.get() != 'b' or not self._pvars:
             return None
         cs = self.CANVAS_SCALE
+        # Centre handle check first (sits on top)
+        if self._center_cid:
+            mx, my = self._center_cid[3], self._center_cid[4]
+            if (x - mx)**2 + (y - my)**2 <= self.HANDLE_HIT**2:
+                return 'center'
+        # Corner handles
         for pt in ('p1', 'p2', 'p3', 'p4'):
             pv = self._pvars.get(pt, {})
             cx = pv.get('tx', tk.DoubleVar()).get() * cs
@@ -706,10 +719,10 @@ class WheelPreviewWindow(tk.Toplevel):
 
     def _on_press(self, evt):
         self._cv.focus_set()
-        # Plate corners take priority (they sit on top in back view)
         pt = self._hit_plate(evt.x, evt.y)
         if pt:
             self._drag_plate = pt
+            self._drag_last  = None if pt == 'center' else None
             self._drag = None
             self._cv.config(cursor='fleur')
             return
@@ -738,7 +751,26 @@ class WheelPreviewWindow(tk.Toplevel):
     def _on_drag(self, evt):
         cs = self.CANVAS_SCALE
 
-        if self._drag_plate:
+        if self._drag_plate == 'center':
+            # Move all 4 plate corners by the delta since last drag event
+            if self._drag_last is None:
+                self._drag_last = (evt.x, evt.y)
+                return
+            dx = (evt.x - self._drag_last[0]) / cs
+            dy = (evt.y - self._drag_last[1]) / cs
+            self._drag_last = (evt.x, evt.y)
+            for pt in ('p1', 'p2', 'p3', 'p4'):
+                pv = self._pvars.get(pt, {})
+                tx_v = pv.get('tx', None)
+                ty_v = pv.get('ty', None)
+                if tx_v: tx_v.set(round(tx_v.get() + dx, 2))
+                if ty_v: ty_v.set(round(ty_v.get() + dy, 2))
+            # Redraw with updated positions
+            self._render()
+            self._coord_lbl.config(text=f"Plate centre drag  Δx={round(dx)}  Δy={round(dy)}")
+            return
+
+        if self._drag_plate and self._drag_plate != 'center':
             pt = self._drag_plate
             pv = self._pvars.get(pt, {})
             gx = max(0, min(self.STAGE_W, evt.x / cs))
@@ -770,8 +802,9 @@ class WheelPreviewWindow(tk.Toplevel):
         self._coord_lbl.config(text=f"{self._drag}: x={round(gx)}  y={round(gy)}")
 
     def _on_release(self, evt):
-        self._drag = None
+        self._drag       = None
         self._drag_plate = None
+        self._drag_last  = None
         self._cv.config(cursor='crosshair')
         self._render()
 
@@ -2894,8 +2927,17 @@ class RimEditorFrame(ttk.Frame):
             final.save(tmp_img, 'PNG')
             out_swf = os.path.join(self.WHEEL_DIR, f"wheel{view}_{new_id}.swf")
             ok = replace_all_images_in_swf(src_swf, {char_id: tmp_img}, out_swf)
-            if ok: built.append(f'wheel{view}_{new_id}.swf')
-            else:  errors.append(f'{view}:build-fail')
+            if ok:
+                built.append(f'wheel{view}_{new_id}.swf')
+                # Update in-memory and disk caches so browser/previews show the modified image
+                _RIM_MEM[(view, new_id)] = final.copy()
+                disk_png = os.path.join(RIM_CACHE_DIR, f"{view}_{new_id}.png")
+                try:
+                    final.save(disk_png, 'PNG')
+                except Exception:
+                    pass
+            else:
+                errors.append(f'{view}:build-fail')
 
         msg = f'Rim {new_id} built: {", ".join(built)}.' if built else f'Build failed: {", ".join(errors)}'
         col = '#00c87a' if not errors else ('#e94560' if not built else '#ffaa00')

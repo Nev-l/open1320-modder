@@ -1,0 +1,47 @@
+# open1320-modder
+
+Car modding tools for Nitto Legends (open1320 / nittolol clients).
+
+## Tools
+
+- **1320CarModder.exe** — Car & rim editor with wheel/plate aligner
+- **Car Installer.exe** — Downloads and installs cars and rim packs from nitto.lol
+
+## Changelog
+
+### v0.2.8
+- Wheel/plate aligner rebuilt: all controls now in a panel **above** the canvas (no side panel that collapses)
+- Added **plate centre-point drag handle** (⊕) — drag it to move all 4 plate corners together
+- Fixed custom/recolored rim thumbnails not updating in the Rim Browser after a build — cache is now invalidated and updated with the modified image on build
+
+### v0.2.7
+- Fix wheel aligner right panel not visible (W%/H% spinboxes + Plate tab)
+
+### v0.2.6
+- Publish to GitHub button — syncs modified cache files to nitto-legends-cache repo and pushes
+
+### v0.2.5
+- Custom rim folder now supports subfolders — each subfolder is one rim pack (4 SWFs), picker shown on load
+
+### v0.2.4
+- Fix rim preview not loading in Car Installer
+
+### v0.2.3
+- Rim pack server upload to nitto.lol (port 8184)
+- Car Installer: added Rims tab alongside Cars tab
+
+### v0.2.2
+- Fix custom SWF rims not displaying (blank images)
+
+### v0.2.1
+- Direct SWF bitmap extraction — no FFDec required for rim previews (handles DefineBitsJPEG3/tag 35)
+
+### v0.2.0
+- Rim image cache (disk + memory) to avoid repeated FFDec extractions
+
+### v0.1.x
+- Rim editor: tint/brightness/custom image per view, Apply-to-All
+- Rim browser: scrollable thumbnail grid
+- Wheel/plate aligner: drag handles, arrow-key nudge, tire/rim overlay loading
+- Plate corner drag (p1–p4)
+- Badge editor, decal editor, car part image replacement
