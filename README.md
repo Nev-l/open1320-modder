@@ -9,6 +9,10 @@ Car modding tools for Nitto Legends (open1320 / nittolol clients).
 
 ## Changelog
 
+### v0.3.0
+- **Fix plate alignment** — the game positions the plate using `bumperRear.actual.p1._x` (PlaceObject2 matrix data inside `bumperRear.swf`), not via the standalone `p1-p4.swf` files. The aligner now reads/writes the correct source: `parse_plate_bumper_swf` / `patch_plate_bumper_swf` decode and patch the bit-packed SWF matrix in-place. Default corner values updated to match actual game positions.
+- The standalone `p1-p4.swf` files are still copied unchanged (game still expects them present)
+
 ### v0.2.9
 - Fixed plate coordinates never saving: build now always writes current tx/ty to p1-p4 SWFs instead of skipping when "unchanged" (the old diff check against `_plate_src` was always zero when source had no plate files)
 - Plate quad on canvas now shows as a semi-transparent filled polygon with a solid yellow outline, coordinate labels on each corner handle, and a centre crosshair handle — makes it much easier to see where the plate sits on the car

@@ -2,7 +2,7 @@
 1320 Legends Car Modder
 Per-part image editing, custom image upload, overlay alignment, and badge editor.
 """
-VERSION = "0.2.9"
+VERSION = "0.3.0"
 import os, sys, shutil, tempfile, threading, math, dataclasses, json, tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk, ImageDraw
@@ -66,6 +66,7 @@ from swf_utils import (get_package_info, list_visual_swfs, export_image,
                         export_badge_images, add_badges_to_swf, get_swf_badge_gap_ids,
                         set_ffdec_path, find_ffdec_default, build_part_swf,
                         parse_tire_swf, patch_tire_swf, swf_rect_origin,
+                        parse_plate_bumper_swf, patch_plate_bumper_swf,
                         read_swf_info)
 from color_utils import apply_color_adjustments, apply_rim_tint
 
@@ -3601,13 +3602,14 @@ class CarModderApp(tk.Tk):
         }
         self._wheel_src: dict[tuple, dict] = {}  # original values from source car
         # Plate corner points (p1-p4), back-view only
+        # Defaults from car 116b bumperRear.swf (the template car)
         self._plate_vars: dict[str, dict[str, tk.DoubleVar]] = {
-            'p1': {'tx': tk.DoubleVar(value=451), 'ty': tk.DoubleVar(value=231)},
-            'p2': {'tx': tk.DoubleVar(value=538), 'ty': tk.DoubleVar(value=234)},
-            'p3': {'tx': tk.DoubleVar(value=542), 'ty': tk.DoubleVar(value=272)},
-            'p4': {'tx': tk.DoubleVar(value=455), 'ty': tk.DoubleVar(value=272)},
+            'p1': {'tx': tk.DoubleVar(value=410.65), 'ty': tk.DoubleVar(value=149.0)},
+            'p2': {'tx': tk.DoubleVar(value=521.35), 'ty': tk.DoubleVar(value=157.4)},
+            'p3': {'tx': tk.DoubleVar(value=525.1),  'ty': tk.DoubleVar(value=205.8)},
+            'p4': {'tx': tk.DoubleVar(value=412.7),  'ty': tk.DoubleVar(value=201.8)},
         }
-        self._plate_src: dict[str, dict] = {}  # original values from source car
+        self._plate_src: dict[str, tuple] = {}  # original (x, y) from source bumperRear.swf
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -4267,17 +4269,20 @@ class CarModderApp(tk.Tk):
                     if var_name in vals:
                         dv.set(round(float(vals[var_name]), 2))
 
-        # Load plate corner points (p1-p4) from back-view package if present
+        # Load plate corner points from bumperRear.swf (p1-p4 clips inside it)
         self._plate_src = {}
         b_pkg = info.get('b', '')
+        bumper_path = os.path.join(b_pkg, 'bumperRear.swf') if b_pkg else ''
+        corners = parse_plate_bumper_swf(bumper_path) if os.path.exists(bumper_path) else {}
         for pt_key in ('p1', 'p2', 'p3', 'p4'):
-            path = os.path.join(b_pkg, f"{pt_key}.swf") if b_pkg else ''
-            vals = parse_tire_swf(path) if os.path.exists(path) else {}
-            self._plate_src[pt_key] = vals
-            pv = self._plate_vars.get(pt_key, {})
-            for var_name, dv in pv.items():
-                if var_name in vals:
-                    dv.set(round(float(vals[var_name]), 2))
+            if pt_key in corners:
+                x, y = corners[pt_key]
+                self._plate_src[pt_key] = (x, y)
+                pv = self._plate_vars.get(pt_key, {})
+                tx_v = pv.get('tx')
+                ty_v = pv.get('ty')
+                if tx_v: tx_v.set(x)
+                if ty_v: ty_v.set(y)
 
     def _reset_wheel_positions(self):
         for key, vals in self._wheel_src.items():
@@ -4774,43 +4779,29 @@ class CarModderApp(tk.Tk):
                             generated.append(dst)
                             continue
 
-                    # Plate corner SWFs (p1-p4) — always write current values
-                    plate_match = f in ('p1.swf', 'p2.swf', 'p3.swf', 'p4.swf')
-                    if plate_match:
-                        pt_key = f[:-4]  # 'p1','p2','p3','p4'
-                        pv = self._plate_vars.get(pt_key, {})
-                        if pv:
-                            overrides = {vn: round(dv.get(), 2) for vn, dv in pv.items()}
-                            log(f"Writing plate {pt_key}: {overrides}")
-                            patch_tire_swf(fp, dst, overrides)
-                            generated.append(dst)
-                            continue
+                    # Skip standalone p1-p4 SWFs — plate positioning is in bumperRear.swf
+                    if f in ('p1.swf', 'p2.swf', 'p3.swf', 'p4.swf'):
+                        if not os.path.exists(dst):
+                            shutil.copy2(fp, dst)
+                        continue
 
                     if not os.path.exists(dst):
                         shutil.copy2(fp, dst)
 
-            # If user edited plate but source car had no p1-p4 SWFs, create them
-            # from game template (only for back view where plates live)
-            if any(self._plate_vars.get(k) for k in ('p1','p2','p3','p4')):
-                _plate_tmpl_dir = os.path.join(PACKAGES_DIR, "116b")
-                b_pkg_out = os.path.join(out_dir, "packages", f"{new_id}b")
-                b_src_pkg = info.get('b', '')
-                os.makedirs(b_pkg_out, exist_ok=True)
-                for pt_key in ('p1', 'p2', 'p3', 'p4'):
-                    pv = self._plate_vars.get(pt_key, {})
-                    if not pv:
-                        continue
-                    dst = os.path.join(b_pkg_out, f"{pt_key}.swf")
-                    if os.path.exists(dst):
-                        continue  # already written above
-                    src_exists = os.path.join(b_src_pkg, f"{pt_key}.swf") if b_src_pkg else ''
-                    tmpl = src_exists if os.path.exists(src_exists) else os.path.join(_plate_tmpl_dir, f"{pt_key}.swf")
-                    if not os.path.exists(tmpl):
-                        continue
-                    overrides = {vn: round(dv.get(), 2) for vn, dv in pv.items()}
-                    log(f"Writing plate {pt_key}: {overrides}")
-                    patch_tire_swf(tmpl, dst, overrides)
-                    generated.append(dst)
+            # Patch bumperRear.swf with new plate corner positions (back-view only)
+            if view == 'b' and self._plate_vars:
+                b_pkg_out  = os.path.join(out_dir, "packages", f"{new_id}b")
+                bumper_dst = os.path.join(b_pkg_out, 'bumperRear.swf')
+                if os.path.exists(bumper_dst):
+                    corners = {
+                        pt: (round(self._plate_vars[pt]['tx'].get(), 2),
+                             round(self._plate_vars[pt]['ty'].get(), 2))
+                        for pt in ('p1', 'p2', 'p3', 'p4')
+                        if pt in self._plate_vars
+                    }
+                    if corners:
+                        log(f"Patching plate corners in bumperRear.swf: {corners}")
+                        patch_plate_bumper_swf(bumper_dst, bumper_dst, corners)
 
             # Copy to game cache
             if copy:

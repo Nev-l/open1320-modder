@@ -897,6 +897,175 @@ def patch_tire_swf(src_path: str, dest_path: str, overrides: dict) -> bool:
         return False
 
 
+def _bit_read(data: bytearray, bit_pos: int, n: int) -> int:
+    """Read n bits starting at bit_pos (MSB first)."""
+    val = 0
+    for i in range(n):
+        b, off = divmod(bit_pos + i, 8)
+        val = (val << 1) | ((data[b] >> (7 - off)) & 1)
+    return val
+
+def _bit_read_signed(data: bytearray, bit_pos: int, n: int) -> int:
+    if n == 0:
+        return 0
+    v = _bit_read(data, bit_pos, n)
+    return v - (1 << n) if v >= (1 << (n - 1)) else v
+
+def _bit_write(data: bytearray, bit_pos: int, value: int, n: int) -> None:
+    """Write n-bit value at bit_pos (MSB first). Handles negative via two's complement."""
+    if value < 0:
+        value += (1 << n)
+    for i in range(n):
+        b, off = divmod(bit_pos + i, 8)
+        mask = 1 << (7 - off)
+        if (value >> (n - 1 - i)) & 1:
+            data[b] |= mask
+        else:
+            data[b] &= ~mask
+
+
+def _swf_matrix_info(data: bytearray, byte_off: int) -> tuple:
+    """Parse a SWF MATRIX starting at byte_off.
+    Returns (tx_px, ty_px, n_trans_bits, tx_bit_pos, ty_bit_pos, end_byte)."""
+    bit = byte_off * 8
+    has_scale = _bit_read(data, bit, 1); bit += 1
+    if has_scale:
+        n = _bit_read(data, bit, 5); bit += 5
+        bit += n * 2  # ScaleX + ScaleY
+    has_rot = _bit_read(data, bit, 1); bit += 1
+    if has_rot:
+        n = _bit_read(data, bit, 5); bit += 5
+        bit += n * 2  # RotateSkew0 + RotateSkew1
+    nt = _bit_read(data, bit, 5); bit += 5
+    tx_bit = bit
+    tx_twips = _bit_read_signed(data, bit, nt); bit += nt
+    ty_bit = bit
+    ty_twips = _bit_read_signed(data, bit, nt); bit += nt
+    if bit % 8:
+        bit += 8 - bit % 8
+    return tx_twips / 20.0, ty_twips / 20.0, nt, tx_bit, ty_bit, bit // 8
+
+
+def _walk_po2_in_sprite(data: bytearray, sprite_ds: int, sprite_end: int,
+                         callback) -> None:
+    """Walk PlaceObject2 (tag 26) tags inside a DefineSprite control block."""
+    p = sprite_ds + 4  # skip sprite_id + frame_count
+    while p < sprite_end:
+        rh = struct.unpack_from('<H', data, p)[0]
+        st, srl = rh >> 6, rh & 0x3F
+        if srl == 0x3F:
+            stlen = struct.unpack_from('<I', data, p + 2)[0]
+            sds = p + 6
+        else:
+            stlen, sds = srl, p + 2
+        if st == 0:
+            break
+        if st == 26:  # PlaceObject2
+            flags = data[sds]
+            off = sds + 1
+            off += 2  # depth
+            if flags & 0x02:
+                off += 2  # char id
+            mat_byte_off = None
+            if flags & 0x04:
+                mat_byte_off = off
+                _, _, nt, tx_b, ty_b, end_b = _swf_matrix_info(data, off)
+                off = end_b
+            if flags & 0x08:
+                off += 4  # HasColorTransform (basic)
+            if flags & 0x10:
+                off += 2  # HasRatio
+            name = None
+            if flags & 0x20:
+                ne = data.index(0, off)
+                name = data[off:ne].decode('ascii', 'ignore')
+            if name and mat_byte_off is not None:
+                callback(name, mat_byte_off)
+        p = sds + stlen
+
+
+def parse_plate_bumper_swf(path: str) -> dict:
+    """Return {'p1':(x,y),'p2':(x,y),'p3':(x,y),'p4':(x,y)} from bumperRear.swf.
+    Positions are in Flash stage pixels (0-640 / 0-400)."""
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+        data = bytearray(_swf_decompress(raw))
+    except OSError:
+        return {}
+
+    result = {}
+    nbits = (data[8] >> 3) & 0x1F
+    p = 8 + (5 + 4 * nbits + 7) // 8 + 4
+
+    while p < len(data) - 1:
+        rh = struct.unpack_from('<H', data, p)[0]
+        tag_type, raw_len = rh >> 6, rh & 0x3F
+        if raw_len == 0x3F:
+            tlen = struct.unpack_from('<I', data, p + 2)[0]; ds = p + 6
+        else:
+            tlen, ds = raw_len, p + 2
+        if tag_type == 0:
+            break
+        if tag_type == 39:  # DefineSprite
+            def _cb(name, mat_off):
+                if name in ('p1', 'p2', 'p3', 'p4'):
+                    tx, ty, *_ = _swf_matrix_info(data, mat_off)
+                    result[name] = (round(tx, 2), round(ty, 2))
+            _walk_po2_in_sprite(data, ds, ds + tlen, _cb)
+        p = ds + tlen
+
+    return result
+
+
+def patch_plate_bumper_swf(src_path: str, dst_path: str, corners: dict) -> bool:
+    """Patch p1-p4 plate corner positions in bumperRear.swf.
+    corners: {'p1': (new_x_px, new_y_px), ...} — only provided names are updated.
+    Translation is patched in-place; N_trans_bits is preserved (must be >= 15 to
+    cover the full 640x400 stage in twips)."""
+    try:
+        with open(src_path, 'rb') as f:
+            raw = f.read()
+        data = bytearray(_swf_decompress(raw))
+    except OSError:
+        return False
+
+    nbits = (data[8] >> 3) & 0x1F
+    p = 8 + (5 + 4 * nbits + 7) // 8 + 4
+
+    while p < len(data) - 1:
+        rh = struct.unpack_from('<H', data, p)[0]
+        tag_type, raw_len = rh >> 6, rh & 0x3F
+        if raw_len == 0x3F:
+            tlen = struct.unpack_from('<I', data, p + 2)[0]; ds = p + 6
+        else:
+            tlen, ds = raw_len, p + 2
+        if tag_type == 0:
+            break
+        if tag_type == 39:  # DefineSprite
+            def _patch_cb(name, mat_off):
+                if name not in corners:
+                    return
+                new_x, new_y = corners[name]
+                _, _, nt, tx_b, ty_b, _ = _swf_matrix_info(data, mat_off)
+                # clamp to signed n-bit range (in twips)
+                max_t = (1 << (nt - 1)) - 1
+                min_t = -(1 << (nt - 1))
+                new_tx = max(min_t, min(max_t, round(new_x * 20)))
+                new_ty = max(min_t, min(max_t, round(new_y * 20)))
+                _bit_write(data, tx_b, new_tx, nt)
+                _bit_write(data, ty_b, new_ty, nt)
+            _walk_po2_in_sprite(data, ds, ds + tlen, _patch_cb)
+        p = ds + tlen
+
+    try:
+        with open(dst_path, 'wb') as f:
+            f.write(data)
+        return True
+    except OSError:
+        return False
+
+
 def get_package_info(packages_dir: str) -> dict[int, dict]:
     """Scan packages dir and return {car_id: {'f': path, 'b': path, 'both': bool}}"""
     cars = {}
