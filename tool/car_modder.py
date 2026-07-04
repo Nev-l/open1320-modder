@@ -287,9 +287,24 @@ class WheelPreviewWindow(tk.Toplevel):
         self._cv.bind('<shift-Down>',  lambda e: self._nudge(  0,  10))
         self._cv.config(takefocus=True)
 
-        # Position + size table (right of canvas) — all 5 wheel positions, both views
-        right = tk.Frame(mid, bg=BG)
-        right.grid(row=0, column=1, sticky='ns', padx=(10, 0))
+        # Position + size table (right of canvas) — scrollable so all controls always reachable
+        right_outer = tk.Frame(mid, bg=BG)
+        right_outer.grid(row=0, column=1, sticky='nsew', padx=(10, 0))
+        right_outer.rowconfigure(0, weight=1)
+        right_outer.columnconfigure(0, weight=1)
+        _rcv = tk.Canvas(right_outer, bg=BG, highlightthickness=0, width=260)
+        _rsb = ttk.Scrollbar(right_outer, orient='vertical', command=_rcv.yview)
+        _rcv.configure(yscrollcommand=_rsb.set)
+        _rcv.grid(row=0, column=0, sticky='nsew')
+        _rsb.grid(row=0, column=1, sticky='ns')
+        right = tk.Frame(_rcv, bg=BG)
+        _rcv_win = _rcv.create_window(0, 0, anchor='nw', window=right)
+        def _on_right_cfg(e):
+            _rcv.configure(scrollregion=_rcv.bbox('all'))
+            _rcv.itemconfigure(_rcv_win, width=_rcv.winfo_width())
+        right.bind('<Configure>', _on_right_cfg)
+        _rcv.bind('<MouseWheel>', lambda e: _rcv.yview_scroll(
+            -1 if e.delta > 0 else 1, 'units'))
 
         pos_lf = ttk.LabelFrame(right, text="Wheel Positions & Size", padding=(8, 4))
         pos_lf.pack(fill='x')
