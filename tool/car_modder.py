@@ -2445,6 +2445,8 @@ class RimEditorFrame(ttk.Frame):
                     width=5).pack(side='left', padx=(4, 0))
         ttk.Button(top, text='Upload to nitto.lol',
                    command=self._upload_rim_pack).pack(side='left', padx=(6, 0))
+        ttk.Button(top, text='Publish to GitHub',
+                   command=self._publish_rim_to_github).pack(side='left', padx=(4, 0))
 
         self._status = ttk.Label(top, text='Load a rim to start editing.',
                                   foreground='#aaa')
@@ -2926,6 +2928,50 @@ class RimEditorFrame(ttk.Frame):
         threading.Thread(target=self._upload_rim_worker,
                          args=(api_key, pack_id, pack_name, rim_id, to_upload),
                          daemon=True).start()
+
+    def _publish_rim_to_github(self):
+        import subprocess, shutil
+        cfg  = _load_config()
+        repo = cfg.get('cache_github_repo', '').strip()
+        if not repo or not os.path.isdir(os.path.join(repo, '.git')):
+            self._status.config(text='cache_github_repo not set in config.', foreground='#e94560')
+            return
+        rim_id = self._upload_rim_id.get()
+        VIEW_FNAME = {'FF': f'wheelFF_{rim_id}.swf', 'FR': f'wheelFR_{rim_id}.swf',
+                      'BF': f'wheelBF_{rim_id}.swf', 'BR': f'wheelBR_{rim_id}.swf'}
+        repo_wheel = os.path.join(repo, 'cache', 'car', 'wheel')
+        copied = []
+        for view, fname in VIEW_FNAME.items():
+            src = os.path.join(self.WHEEL_DIR, fname)
+            if os.path.exists(src):
+                os.makedirs(repo_wheel, exist_ok=True)
+                shutil.copy2(src, os.path.join(repo_wheel, fname))
+                copied.append(fname)
+        if not copied:
+            self._status.config(text='No built wheel SWFs found — build first.', foreground='#e94560')
+            return
+        self._status.config(text='Pushing to GitHub…', foreground='#aaa')
+
+        def _worker():
+            try:
+                subprocess.run(['git', '-C', repo, 'add', 'cache/car/wheel/'], check=True)
+                subprocess.run(['git', '-C', repo, 'commit', '-m',
+                                f'update: rim slot {rim_id} ({len(copied)} files)'], check=True)
+                r = subprocess.run(['git', '-C', repo, 'push'],
+                                   capture_output=True, text=True)
+                if r.returncode == 0:
+                    self.after(0, lambda: self._status.config(
+                        text=f'GitHub: pushed rim {rim_id} ({len(copied)} files).',
+                        foreground='#00c87a'))
+                else:
+                    err = r.stderr.strip()
+                    self.after(0, lambda: self._status.config(
+                        text=f'Push failed: {err}', foreground='#e94560'))
+            except Exception as e:
+                self.after(0, lambda: self._status.config(
+                    text=f'GitHub error: {e}', foreground='#e94560'))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _upload_rim_worker(self, api_key, pack_id, pack_name, rim_id, to_upload):
         import urllib.request, urllib.error
@@ -3532,6 +3578,74 @@ class CarModderApp(tk.Tk):
             "Please locate ffdec.bat to enable SWF editing.")
         self._locate_ffdec()
 
+    def _publish_to_github(self):
+        """Sync modified cache files to the local GitHub repo clone and push."""
+        import subprocess, shutil
+
+        repo = self._cfg.get('cache_github_repo', '').strip()
+        if not repo or not os.path.isdir(os.path.join(repo, '.git')):
+            repo = filedialog.askdirectory(
+                title='Select the GAME CACHE TO GITHUB git repo folder')
+            if not repo or not os.path.isdir(os.path.join(repo, '.git')):
+                messagebox.showerror('Not a git repo',
+                    'Select the folder that contains the .git directory.',
+                    parent=self)
+                return
+            self._cfg['cache_github_repo'] = repo
+            _save_config(self._cfg)
+
+        repo_cache = os.path.join(repo, 'cache')
+        game_cache = CACHE_DIR  # live game cache
+
+        # Mirror entire game cache → repo cache, then commit changed files only
+        def _worker():
+            try:
+                # Find files modified in game cache more recently than repo counterpart
+                synced = []
+                for root, dirs, files in os.walk(game_cache):
+                    dirs.sort()
+                    for fname in sorted(files):
+                        src  = os.path.join(root, fname)
+                        rel  = os.path.relpath(src, game_cache)
+                        dest = os.path.join(repo_cache, rel)
+                        if (not os.path.exists(dest) or
+                                os.path.getmtime(src) > os.path.getmtime(dest)):
+                            os.makedirs(os.path.dirname(dest), exist_ok=True)
+                            shutil.copy2(src, dest)
+                            synced.append(rel)
+
+                if not synced:
+                    self.after(0, lambda: messagebox.showinfo(
+                        'Nothing to publish', 'No cache files have changed since last publish.',
+                        parent=self))
+                    return
+
+                # git add + commit + push
+                subprocess.run(['git', '-C', repo, 'add', 'cache/'], check=True)
+                msg = f'update: {len(synced)} cache file(s)'
+                subprocess.run(['git', '-C', repo, 'commit', '-m', msg], check=True)
+                result = subprocess.run(['git', '-C', repo, 'push'],
+                                        capture_output=True, text=True)
+                if result.returncode == 0:
+                    self.after(0, lambda: messagebox.showinfo(
+                        'Published',
+                        f'{len(synced)} file(s) pushed to GitHub.\n\n'
+                        + '\n'.join(synced[:10])
+                        + ('\n…' if len(synced) > 10 else ''),
+                        parent=self))
+                else:
+                    err = result.stderr.strip()
+                    self.after(0, lambda: messagebox.showerror(
+                        'Push failed', f'git push failed:\n\n{err}', parent=self))
+            except Exception as e:
+                self.after(0, lambda: messagebox.showerror(
+                    'Error', str(e), parent=self))
+
+        threading.Thread(target=_worker, daemon=True).start()
+        messagebox.showinfo('Publishing…',
+            'Syncing cache and pushing to GitHub in the background.\n'
+            'You will be notified when complete.', parent=self)
+
     def _locate_ffdec(self):
         path = filedialog.askopenfilename(
             title="Locate ffdec.bat",
@@ -3625,6 +3739,8 @@ class CarModderApp(tk.Tk):
                    text=f"Game: {GAME_DIR}   |   Cache: {CACHE_DIR}   |   "
                         f"Packages: {PACKAGES_DIR}",
                    foreground="#444", font=("Segoe UI",7)).pack(side="left", anchor="w")
+        ttk.Button(info, text="Publish to GitHub", style="Accent.TButton",
+                   command=self._publish_to_github).pack(side="right", padx=(4, 0))
         ttk.Button(info, text="Change FFDec…", width=14,
                    command=self._locate_ffdec).pack(side="right", padx=(4, 0))
         self._ffdec_lbl = ttk.Label(info, text="FFDec: checking…",
