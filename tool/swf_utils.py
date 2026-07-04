@@ -311,6 +311,11 @@ def export_image(swf_path: str, out_dir: str) -> str | None:
 def export_all_images(swf_path: str, out_dir: str) -> dict[int, str]:
     """Export all embedded images from a SWF.
     Returns {char_id: file_path} for images above MIN_IMAGE_BYTES."""
+    import shutil
+    # Always start with a clean directory so stale files from previous extractions
+    # don't pollute the result (glob picks up everything in the dir).
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
     _run_ffdec("-export", "image", out_dir, swf_path, timeout=30)
     result = {}
@@ -339,12 +344,26 @@ def replace_all_images_in_swf(src_swf: str, replacements: dict[int, str],
     replacements: {char_id: new_image_path}"""
     import shutil, tempfile
     if not replacements:
-        shutil.copy2(src_swf, out_swf)
+        if os.path.normcase(os.path.abspath(src_swf)) != os.path.normcase(os.path.abspath(out_swf)):
+            shutil.copy2(src_swf, out_swf)
         return True
 
     items = list(replacements.items())
     tmp_files = []
-    current_src = src_swf
+
+    # When src and dst are the same file, FFDec may read a truncated/empty file because
+    # the output path gets opened for writing before the read completes.  Copy to a temp
+    # file and use that as the source to guarantee a clean read.
+    src_abs = os.path.normcase(os.path.abspath(src_swf))
+    out_abs = os.path.normcase(os.path.abspath(out_swf))
+    if src_abs == out_abs:
+        tmp_src = tempfile.NamedTemporaryFile(suffix=".swf", delete=False)
+        tmp_src.close()
+        shutil.copy2(src_swf, tmp_src.name)
+        current_src = tmp_src.name
+        tmp_files.append(tmp_src.name)
+    else:
+        current_src = src_swf
 
     try:
         for i, (char_id, new_img) in enumerate(items):
@@ -364,7 +383,7 @@ def replace_all_images_in_swf(src_swf: str, replacements: dict[int, str],
             current_src = dest
     finally:
         for f in tmp_files:
-            if f != out_swf:
+            if os.path.normcase(os.path.abspath(f)) != out_abs:
                 try:
                     os.unlink(f)
                 except OSError:

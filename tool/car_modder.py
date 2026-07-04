@@ -2,7 +2,7 @@
 1320 Legends Car Modder
 Per-part image editing, custom image upload, overlay alignment, and badge editor.
 """
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 import os, sys, shutil, tempfile, threading, math, dataclasses, json, tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk, ImageDraw

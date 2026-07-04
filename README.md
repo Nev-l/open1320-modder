@@ -9,6 +9,10 @@ Car modding tools for Nitto Legends (open1320 / nittolol clients).
 
 ## Changelog
 
+### v0.3.6
+- **Fix rim images loading incorrectly from source SWF**: `export_all_images` was reusing the same output directory across calls without clearing it. Stale `{char_id}.png` files from previous extractions would accumulate and be picked up by `glob`, causing the wrong image to be returned. Directory is now wiped clean before each FFDec export.
+- **Fix rim FF (and any view) sometimes not rewritten on rebuild**: when the source and output SWF path are the same file (rebuilding same slot), FFDec could open the output for writing before finishing the read, producing an empty or unchanged result. Source is now copied to a temp file first when src == dst.
+
 ### v0.3.5
 - **Fix rim builder — FF view outputs original rim**: two root causes: (1) `_build_worker` was reading tkinter `Scale` variables (`_tint_str`, `_bri`) from a non-main thread — Tcl is not thread-safe so the first view in the loop (always FF) could silently read stale 0 values instead of the user-set strength/brightness, producing an untinted output while FR/BF/BR got the correct values. Fixed by snapshotting all tkinter variables on the main thread before spawning the worker. (2) After a build, `_RIM_MEM` was storing the post-tint (tinted) image, so reloading the same slot would use the already-tinted image as the base for the NEXT build, compounding tints. Fixed by storing the pre-tint base image in the cache instead.
 - **Fix rim builder — wrong char_id selected when SWF has multiple bitmaps**: used `list(imgs.keys())[0]` (arbitrary dict order) instead of the char_id of the largest bitmap, which could replace a mask/secondary bitmap and leave the main rim unchanged. Now mirrors `export_image`'s `max(..., key=getsize)` logic.
