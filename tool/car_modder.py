@@ -2267,47 +2267,71 @@ class RimEditorFrame(ttk.Frame):
 
     # ── Actions ────────────────────────────────────────────────────────────────
 
+    # Neutral mid-grey used as the preview background so transparent rim areas show
+    _PREVIEW_BG = (120, 120, 120, 255)
+
     def _load_rim(self):
         rim_id = self._rim_id.get()
-        self._tk_imgs.clear()
-        missing = []
-        for view, _ in self.VIEWS:
+        self._status.config(text=f'Loading rim {rim_id}…', foreground='#aaa')
+        threading.Thread(target=self._load_worker, args=(rim_id,), daemon=True).start()
+
+    def _load_worker(self, rim_id: int):
+        results = {}
+        for view, label in self.VIEWS:
             path = os.path.join(self.WHEEL_DIR, f"wheel{view}_{rim_id}.swf")
             if not os.path.exists(path):
-                missing.append(view)
-                self._previews[view] = None
-                self._custom[view]   = None
-                self._view_panels[view]['lf'].configure(text=f'{view} — not found')
-                self._clear_canvas(view)
+                results[view] = None
                 continue
             out_dir = os.path.join(self._tmp, f"rim_{rim_id}_{view}")
-            imgs = export_all_images(path, out_dir)
-            if imgs:
-                img = Image.open(list(imgs.values())[0]).convert('RGBA')
-            else:
-                img = Image.new('RGBA', (160, 160), (30, 30, 30, 255))
-            self._previews[view] = img
-            self._custom[view]   = None
-            _, label = next((v, l) for v, l in self.VIEWS if v == view)
-            self._view_panels[view]['lf'].configure(text=label)
-            self._refresh_preview(view)
-        msg = f'Rim {rim_id} loaded.'
-        if missing:
-            msg += f'  (no {view} SWF: {", ".join(missing)})'
-        self._status.config(text=msg, foreground='#aaa')
+            try:
+                img_path = export_image(path, out_dir)
+                img = Image.open(img_path).convert('RGBA') if img_path else None
+            except Exception:
+                img = None
+            results[view] = img
+
+        def _finish():
+            missing = []
+            for view, label in self.VIEWS:
+                img = results[view]
+                self._previews[view] = img
+                self._custom[view]   = None
+                if img is None:
+                    missing.append(view)
+                    self._view_panels[view]['lf'].configure(text=f'{view} — not found')
+                    self._clear_canvas(view)
+                else:
+                    self._view_panels[view]['lf'].configure(text=label)
+                    self._refresh_preview(view)
+            msg = f'Rim {rim_id} loaded.'
+            if missing:
+                msg += f'  (missing: {", ".join(missing)})'
+            self._status.config(text=msg, foreground='#aaa')
+
+        self.after(0, _finish)
 
     def _refresh_preview(self, view: str):
         src = self._previews.get(view)
         if src is None:
             return
         custom_path = self._custom.get(view)
-        img = Image.open(custom_path).convert('RGBA') if custom_path else src.copy()
-        img = apply_color_adjustments(img,
+        raw = Image.open(custom_path).convert('RGBA') if custom_path else src.copy()
+        raw = apply_color_adjustments(raw,
                                       self._hue[view].get(),
                                       self._sat[view].get(),
                                       self._bri[view].get())
-        img = img.resize((160, 160), Image.LANCZOS)
-        tkimg = ImageTk.PhotoImage(img)
+        # Composite over neutral grey so transparent areas are visible
+        bg  = Image.new('RGBA', raw.size, self._PREVIEW_BG)
+        bg.paste(raw, mask=raw)
+        # Fit into 160×160 keeping aspect ratio, pad remainder with bg colour
+        raw_w, raw_h = bg.size
+        scale = min(160 / raw_w, 160 / raw_h)
+        nw, nh = max(1, int(raw_w * scale)), max(1, int(raw_h * scale))
+        bg = bg.resize((nw, nh), Image.LANCZOS)
+        canvas_img = Image.new('RGBA', (160, 160), self._PREVIEW_BG)
+        ox, oy = (160 - nw) // 2, (160 - nh) // 2
+        canvas_img.paste(bg, (ox, oy))
+        tkimg = ImageTk.PhotoImage(canvas_img)
         self._tk_imgs.append(tkimg)
         cv = self._view_panels[view]['cv']
         cv.delete('all')
@@ -2316,7 +2340,7 @@ class RimEditorFrame(ttk.Frame):
     def _clear_canvas(self, view: str):
         cv = self._view_panels[view]['cv']
         cv.delete('all')
-        cv.create_text(80, 80, text='N/A', fill='#333', font=('Segoe UI', 12))
+        cv.create_text(80, 80, text='N/A', fill='#555', font=('Segoe UI', 12))
 
     def _upload(self, view: str):
         path = filedialog.askopenfilename(
@@ -2337,24 +2361,30 @@ class RimEditorFrame(ttk.Frame):
     def _build_rim(self):
         new_id = self._new_id.get()
         src_id = self._rim_id.get()
+        self._status.config(text=f'Building rim {new_id}…', foreground='#aaa')
+        threading.Thread(target=self._build_worker,
+                         args=(src_id, new_id), daemon=True).start()
+
+    def _build_worker(self, src_id: int, new_id: int):
         built, errors = [], []
         for view, _ in self.VIEWS:
             src_swf = os.path.join(self.WHEEL_DIR, f"wheel{view}_{src_id}.swf")
             if not os.path.exists(src_swf):
-                errors.append(f'{view}:missing')
+                errors.append(f'{view}:no-source')
                 continue
+            # Get char_id by exporting first
             out_dir = os.path.join(self._tmp, f"rim_{src_id}_{view}")
             imgs = export_all_images(src_swf, out_dir)
             if not imgs:
                 errors.append(f'{view}:no-img')
                 continue
             char_id = list(imgs.keys())[0]
-            src = self._previews.get(view)
+            src_img = self._previews.get(view)
             custom_path = self._custom.get(view)
             if custom_path:
                 final = Image.open(custom_path).convert('RGBA')
-            elif src:
-                final = src.copy()
+            elif src_img:
+                final = src_img.copy()
             else:
                 errors.append(f'{view}:no-preview')
                 continue
@@ -2362,20 +2392,16 @@ class RimEditorFrame(ttk.Frame):
                                             self._hue[view].get(),
                                             self._sat[view].get(),
                                             self._bri[view].get())
-            # Save as JPEG (matching original format)
-            tmp_img = os.path.join(self._tmp, f"rim_bld_{new_id}_{view}.jpg")
-            final.convert('RGB').save(tmp_img, 'JPEG', quality=95)
+            tmp_img = os.path.join(self._tmp, f"rim_bld_{new_id}_{view}.png")
+            final.save(tmp_img, 'PNG')
             out_swf = os.path.join(self.WHEEL_DIR, f"wheel{view}_{new_id}.swf")
             ok = replace_all_images_in_swf(src_swf, {char_id: tmp_img}, out_swf)
-            if ok:
-                built.append(f'wheel{view}_{new_id}.swf')
-            else:
-                errors.append(f'{view}:build-fail')
+            if ok: built.append(f'wheel{view}_{new_id}.swf')
+            else:  errors.append(f'{view}:build-fail')
 
-        msg = f'Built rim {new_id}: {", ".join(built)}.'
-        if errors:
-            msg += f'  Errors: {", ".join(errors)}'
-        self._status.config(text=msg, foreground='#00c87a' if not errors else '#e94560')
+        msg = f'Rim {new_id} built: {", ".join(built)}.' if built else f'Build failed: {", ".join(errors)}'
+        col = '#00c87a' if not errors else ('#e94560' if not built else '#ffaa00')
+        self.after(0, lambda: self._status.config(text=msg, foreground=col))
 
 
 class BadgeEditorFrame(ttk.Frame):
