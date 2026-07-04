@@ -174,7 +174,7 @@ class WheelPreviewWindow(tk.Toplevel):
     """Visual wheel position editor with real tire/wheel image overlays."""
 
     STAGE_W, STAGE_H = 640, 400
-    CANVAS_SCALE = 1.5          # visual scale — game coords stay 640×400
+    CANVAS_SCALE = 1.1          # visual scale — game coords stay 640×400
     HANDLE_R   = 12
     HANDLE_HIT = 20
     TIRE_COLORS = {'F': '#00d4ff', 'R': '#ff6b6b', 'Back': '#00ff88'}
@@ -289,7 +289,7 @@ class WheelPreviewWindow(tk.Toplevel):
 
         # Right panel — Notebook with Wheels tab + Plate tab
         right = tk.Frame(mid, bg=BG)
-        right.grid(row=0, column=1, sticky='ns', padx=(10, 0))
+        right.grid(row=0, column=1, sticky='nsew', padx=(10, 0))
 
         nb = ttk.Notebook(right)
         nb.pack(fill='both', expand=True)
@@ -2389,6 +2389,8 @@ class RimEditorFrame(ttk.Frame):
                    command=self._load_rim).pack(side='left', padx=(6, 0))
         ttk.Button(top, text='Browse…',
                    command=self._open_browser).pack(side='left', padx=(4, 0))
+        ttk.Button(top, text='Load Custom Folder…',
+                   command=self._load_custom_folder).pack(side='left', padx=(4, 0))
 
         ttk.Separator(top, orient='vertical').pack(side='left', fill='y', padx=12)
 
@@ -2548,6 +2550,62 @@ class RimEditorFrame(ttk.Frame):
                 msg += f'  (missing: {", ".join(missing)})'
             self._status.config(text=msg, foreground='#aaa')
 
+        self.after(0, _finish)
+
+    def _load_custom_folder(self):
+        """Let user pick a folder of custom rim SWFs and map them to FF/FR/BF/BR views."""
+        folder = filedialog.askdirectory(title='Select folder containing custom rim SWFs')
+        if not folder:
+            return
+        # Map partial name → view key
+        VIEW_HINTS = [
+            ('wheelFF', 'FF'), ('wheelFR', 'FR'), ('wheelBF', 'BF'), ('wheelBR', 'BR'),
+            ('wheelR',  'BF'),   # common alternate name for BF view
+        ]
+        found: dict[str, str] = {}  # view → filepath
+        for fname in os.listdir(folder):
+            if not fname.lower().endswith('.swf'):
+                continue
+            fupper = fname.upper()
+            for hint, view in VIEW_HINTS:
+                if hint.upper() in fupper and view not in found:
+                    found[view] = os.path.join(folder, fname)
+                    break
+
+        if not found:
+            messagebox.showinfo('Custom Folder', 'No recognisable rim SWFs found.\n'
+                'Expected filenames containing: wheelFF, wheelFR, wheelBF, wheelBR (or wheelR).',
+                parent=self)
+            return
+
+        self._status.config(text=f'Loading {len(found)} custom SWF(s)…', foreground='#aaa')
+        threading.Thread(target=self._load_custom_worker, args=(found,), daemon=True).start()
+
+    def _load_custom_worker(self, found: dict):
+        results = {}
+        for view, path in found.items():
+            out_dir = os.path.join(self._tmp, f'custom_{view}')
+            try:
+                img_path = export_image(path, out_dir)
+                img = Image.open(img_path).convert('RGBA') if img_path else None
+            except Exception:
+                img = None
+            results[view] = (img, path)
+
+        def _finish():
+            for view, (img, path) in results.items():
+                self._previews[view] = img
+                self._custom[view]   = path
+                lbl = dict(self.VIEWS).get(view, view)
+                if img:
+                    self._view_panels[view]['lf'].configure(text=f'{lbl} [custom]')
+                    self._refresh_preview(view)
+                else:
+                    self._view_panels[view]['lf'].configure(text=f'{lbl} [load failed]')
+                    self._clear_canvas(view)
+            self._status.config(
+                text=f'Custom folder loaded ({len(results)} views: {", ".join(results)}).',
+                foreground='#aaa')
         self.after(0, _finish)
 
     # ── Color helpers ──────────────────────────────────────────────────────────
