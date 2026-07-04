@@ -20,6 +20,44 @@ CACHE_DIR        = os.path.join(GAME_DIR, "cache")
 PACKAGES_DIR     = os.path.join(CACHE_DIR, "car", "packages")
 CAR_DIR          = os.path.join(CACHE_DIR, "car")
 OUTPUT_DIR       = os.path.join(BASE_DIR, "output")
+RIM_CACHE_DIR    = os.path.join(BASE_DIR, "rim_cache")
+
+# In-memory rim image cache: (view, rim_id) → PIL Image  (lives for the whole session)
+_RIM_MEM: dict = {}
+
+def _get_rim_image(view: str, rim_id: int, wheel_dir: str, tmp_dir: str):
+    """Return PIL Image for a rim view, using disk+memory cache to avoid repeat FFDec calls."""
+    key = (view, rim_id)
+    if key in _RIM_MEM:
+        return _RIM_MEM[key]
+
+    swf = os.path.join(wheel_dir, f"wheel{view}_{rim_id}.swf")
+    if not os.path.exists(swf):
+        return None
+
+    os.makedirs(RIM_CACHE_DIR, exist_ok=True)
+    cached_png = os.path.join(RIM_CACHE_DIR, f"{view}_{rim_id}.png")
+
+    # Use disk cache if it exists and is newer than the SWF
+    if os.path.exists(cached_png) and os.path.getmtime(cached_png) >= os.path.getmtime(swf):
+        try:
+            img = Image.open(cached_png).convert('RGBA')
+            _RIM_MEM[key] = img
+            return img
+        except Exception:
+            pass  # fall through to re-extract
+
+    # Extract via FFDec and save to disk cache
+    try:
+        img_path = export_image(swf, os.path.join(tmp_dir, f"rim_{rim_id}_{view}"))
+        if not img_path:
+            return None
+        img = Image.open(img_path).convert('RGBA')
+        img.save(cached_png, 'PNG')
+        _RIM_MEM[key] = img
+        return img
+    except Exception:
+        return None
 
 sys.path.insert(0, _BUNDLE_DIR)
 import swf_utils
@@ -2296,24 +2334,20 @@ class RimBrowserWindow(tk.Toplevel):
         threading.Thread(target=self._export_worker, daemon=True).start()
 
     def _export_worker(self):
+        T = self.THUMB
         for idx, rid in enumerate(self._rim_ids):
-            swf = os.path.join(self._wheel_dir, f'wheelFF_{rid}.swf')
-            out_dir = os.path.join(self._tmp, f'rbr_{rid}')
-            try:
-                img_path = export_image(swf, out_dir)
-                if img_path:
-                    img = Image.open(img_path).convert('RGBA')
-                    T = self.THUMB
+            img = _get_rim_image('FF', rid, self._wheel_dir, self._tmp)
+            if img:
+                try:
                     bg = Image.new('RGBA', (T, T), (80, 80, 80, 255))
                     raw_w, raw_h = img.size
                     scale = min(T / raw_w, T / raw_h)
-                    nw, nh = max(1, int(raw_w*scale)), max(1, int(raw_h*scale))
-                    img = img.resize((nw, nh), Image.LANCZOS)
-                    ox, oy = (T-nw)//2, (T-nh)//2
-                    bg.paste(img, (ox, oy), img)
+                    nw, nh = max(1, int(raw_w * scale)), max(1, int(raw_h * scale))
+                    thumb = img.resize((nw, nh), Image.LANCZOS)
+                    bg.paste(thumb, ((T - nw) // 2, (T - nh) // 2), thumb)
                     self.after(0, self._place_thumb, idx, rid, bg)
-            except Exception:
-                pass
+                except Exception:
+                    pass
         self.after(0, lambda: self._status.config(
             text=f'{len(self._rim_ids)} rims. Click to select.', foreground='#aaa'))
 
@@ -2520,17 +2554,7 @@ class RimEditorFrame(ttk.Frame):
     def _load_worker(self, rim_id: int):
         results = {}
         for view, label in self.VIEWS:
-            path = os.path.join(self.WHEEL_DIR, f"wheel{view}_{rim_id}.swf")
-            if not os.path.exists(path):
-                results[view] = None
-                continue
-            out_dir = os.path.join(self._tmp, f"rim_{rim_id}_{view}")
-            try:
-                img_path = export_image(path, out_dir)
-                img = Image.open(img_path).convert('RGBA') if img_path else None
-            except Exception:
-                img = None
-            results[view] = img
+            results[view] = _get_rim_image(view, rim_id, self.WHEEL_DIR, self._tmp)
 
         def _finish():
             missing = []
