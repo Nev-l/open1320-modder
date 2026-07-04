@@ -2971,14 +2971,20 @@ class CarModderApp(tk.Tk):
         ttk.Button(custom_lf, text="Open Overlay Tool",
                     command=self._open_overlay).grid(row=1, column=1, sticky="ew")
 
+        ttk.Button(custom_lf, text="Align / Transform Existing Part…",
+                    command=self._align_existing).grid(row=2, column=0, columnspan=2,
+                                                        sticky="ew", pady=(4,0))
+
         ttk.Button(custom_lf, text="Clear override (revert to original)",
-                    command=self._clear_override).grid(row=2, column=0, columnspan=2,
+                    command=self._clear_override).grid(row=3, column=0, columnspan=2,
                                                         sticky="ew", pady=(4,0))
 
         ttk.Label(custom_lf,
                    text="Overlay tool shows original vs new image overlaid so\n"
-                        "you can verify positioning before committing.",
-                   foreground="#555", font=("Segoe UI",8)).grid(row=3, column=0,
+                        "you can verify positioning before committing.\n"
+                        "\"Align Existing\" lets you stretch/skew the current part image\n"
+                        "without uploading a new one (useful for shadow tweaks etc.)",
+                   foreground="#555", font=("Segoe UI",8)).grid(row=4, column=0,
                                                                   columnspan=2, sticky="w",
                                                                   pady=(6,0))
 
@@ -3374,6 +3380,31 @@ class CarModderApp(tk.Tk):
             self._draw_mod(slot)
 
         OverlayWindow(self, orig, new, _accept, _reject)
+
+    def _align_existing(self):
+        """Open overlay aligner using the current slot's own image — no upload needed.
+        Lets you stretch/skew/reposition an existing part (shadow, undercarriage, etc.)."""
+        slot = self._sel
+        if slot is None:
+            messagebox.showinfo("Nothing selected", "Select a part first.")
+            return
+        orig = slot.orig_image()
+        # Use the current final image (with any colour/decal adjustments) as the overlay
+        current = slot.final_image().copy()
+
+        def _accept(baked_img: Image.Image):
+            baked_path = os.path.join(
+                self._tmp, f"align_{slot.char_id}_{os.path.basename(slot.swf_path)}.png")
+            baked_img.save(baked_path, "PNG")
+            slot.custom_path = baked_path
+            self._draw_mod(slot)
+            self._custom_label.config(
+                text=f"Aligned: {os.path.basename(baked_path)} ✓", foreground=ACC)
+
+        def _reject():
+            pass  # leave slot unchanged
+
+        OverlayWindow(self, orig, current, _accept, _reject)
 
     def _clear_override(self):
         if self._sel:
