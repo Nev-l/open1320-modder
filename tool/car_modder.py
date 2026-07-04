@@ -305,7 +305,7 @@ class WheelPreviewWindow(tk.Toplevel):
 
         def _spin(parent, dv, lo, hi, w=5):
             sp = tk.Spinbox(parent, textvariable=dv, from_=lo, to=hi, increment=1,
-                            width=w, bg=MID, fg=ACC, buttonbackground='#0f3460',
+                            width=w, bg='#16213e', fg=ACC, buttonbackground='#0f3460',
                             relief='flat', font=('Consolas', 9))
             dv.trace_add('write', lambda *_: self.after(0, self._render))
             return sp
