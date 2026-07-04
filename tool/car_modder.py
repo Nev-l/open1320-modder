@@ -2588,11 +2588,68 @@ class RimEditorFrame(ttk.Frame):
 
         self.after(0, _finish)
 
+    def _pick_rim_subfolder(self, parent_folder: str, subfolders: list[str]) -> str | None:
+        """Show a modal listbox so the user can pick which rim pack subfolder to load."""
+        win = tk.Toplevel(self)
+        win.title('Choose Rim Pack')
+        win.configure(bg=DARK)
+        win.resizable(False, False)
+        win.grab_set()
+        result = [None]
+
+        ttk.Label(win, text='Select a rim pack to load:',
+                  font=('Segoe UI', 9)).pack(padx=12, pady=(10, 4), anchor='w')
+
+        lb_frame = ttk.Frame(win)
+        lb_frame.pack(padx=12, pady=(0, 4), fill='both')
+        lb = tk.Listbox(lb_frame, bg=MID, fg=FG, selectbackground=ACC,
+                        selectforeground=DARK, font=('Segoe UI', 9),
+                        width=40, height=min(len(subfolders), 12),
+                        activestyle='none', relief='flat')
+        sb = ttk.Scrollbar(lb_frame, orient='vertical', command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side='left', fill='both')
+        sb.pack(side='left', fill='y')
+        for name in subfolders:
+            lb.insert('end', name)
+        lb.selection_set(0)
+
+        def _ok(*_):
+            sel = lb.curselection()
+            if sel:
+                result[0] = os.path.join(parent_folder, subfolders[sel[0]])
+            win.destroy()
+
+        lb.bind('<Double-1>', _ok)
+        btn_fr = ttk.Frame(win)
+        btn_fr.pack(padx=12, pady=(4, 10), fill='x')
+        ttk.Button(btn_fr, text='Load', style='Accent.TButton',
+                   command=_ok).pack(side='right', padx=(4, 0))
+        ttk.Button(btn_fr, text='Cancel',
+                   command=win.destroy).pack(side='right')
+
+        self.wait_window(win)
+        return result[0]
+
     def _load_custom_folder(self):
         """Let user pick a folder of custom rim SWFs and map them to FF/FR/BF/BR views."""
         folder = filedialog.askdirectory(title='Select folder containing custom rim SWFs')
         if not folder:
             return
+
+        # If user selected the parent folder (contains subfolders, not SWFs directly),
+        # show a chooser so they can pick which pack to load.
+        entries   = os.listdir(folder)
+        has_swfs  = any(e.lower().endswith('.swf') for e in entries)
+        subfolders = [e for e in sorted(entries)
+                      if os.path.isdir(os.path.join(folder, e))
+                      and any(f.lower().endswith('.swf')
+                              for f in os.listdir(os.path.join(folder, e)))]
+
+        if not has_swfs and subfolders:
+            folder = self._pick_rim_subfolder(folder, subfolders)
+            if not folder:
+                return
 
         VIEW_HINTS = [
             ('wheelFF', 'FF'), ('wheelFR', 'FR'), ('wheelBF', 'BF'), ('wheelBR', 'BR'),
