@@ -194,11 +194,13 @@ class WheelPreviewWindow(tk.Toplevel):
         self._car_id    = car_id
         self._tmp_dir   = tmp_dir
         self._view      = tk.StringVar(value='f')
-        self._drag      = None
+        self._drag        = None         # tire being dragged ('F','R','Back') or None
+        self._drag_plate  = None         # plate corner being dragged ('p1'..'p4') or None
         self._tk_img    = None
         self._tk_bg     = None
         self._tk_ovls   = []           # keep PhotoImage refs alive
         self._cids      = {}
+        self._plate_cids = {}          # pt -> (oval_id, text_id)
         self._body_off  = {}           # view -> (xmin, ymin) from body SWF RECT
         self._body_size = {}           # view -> (width_px, height_px) from body SWF RECT
         self._overlays  = {}           # (view,layer,tire) -> PIL.Image
@@ -386,7 +388,7 @@ class WheelPreviewWindow(tk.Toplevel):
         foot.grid(row=2, column=0, sticky='ew')
         self._coord_lbl = ttk.Label(
             foot,
-            text='Drag coloured circles to move wheels  |  Arrow keys = 1px nudge  |  Shift+Arrow = 10px',
+            text='Drag circles to move wheels/plate corners  |  Arrow keys = 1px nudge  |  Shift+Arrow = 10px  |  Switch to Back view for plate',
             foreground='#555', font=('Segoe UI', 8))
         self._coord_lbl.pack(side='left')
         ttk.Button(foot, text='Close', command=self.destroy).pack(side='right')
@@ -574,6 +576,7 @@ class WheelPreviewWindow(tk.Toplevel):
                                   fill='#444', font=('Segoe UI', 12))
 
         # 4. Plate quad (back view only) — outline + draggable corner handles
+        self._plate_cids.clear()
         if view == 'b' and self._pvars:
             PLATE_COLORS = {'p1': '#ffaa00', 'p2': '#ff44cc', 'p3': '#44ffcc', 'p4': '#aaaaff'}
             pts_canvas = []
@@ -587,14 +590,15 @@ class WheelPreviewWindow(tk.Toplevel):
                 x0, y0 = pts_canvas[i]
                 x1, y1 = pts_canvas[(i+1) % 4]
                 self._cv.create_line(x0, y0, x1, y1, fill='#ffff00', width=1, dash=(4, 3))
-            # Draw corner handles
-            r = 7
+            # Draw corner handles — store IDs for smooth drag
+            r = 8
             for pt, (cx, cy) in zip(('p1','p2','p3','p4'), pts_canvas):
                 col = PLATE_COLORS[pt]
-                self._cv.create_oval(cx-r, cy-r, cx+r, cy+r,
-                                      outline=col, fill='', width=2)
-                self._cv.create_text(cx, cy, text=pt, fill=col,
-                                      font=('Segoe UI', 6))
+                oid = self._cv.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                            outline=col, fill=BG, width=2)
+                tid = self._cv.create_text(cx, cy, text=pt, fill=col,
+                                            font=('Segoe UI', 6, 'bold'))
+                self._plate_cids[pt] = (oid, tid)
 
         # 3. Draggable circles — only for visible positions
         tires_for_view = ['F', 'R'] + (['Back'] if view == 'b' else [])
@@ -627,18 +631,38 @@ class WheelPreviewWindow(tk.Toplevel):
             key = (view, tire)
             if key not in self._wvars:
                 continue
-            # Compare in canvas space (game coords × cs)
             cx = self._wvars[key]['tx'].get() * cs
             cy = self._wvars[key]['ty'].get() * cs
             if (x - cx)**2 + (y - cy)**2 <= self.HANDLE_HIT**2:
                 return tire
         return None
 
+    def _hit_plate(self, x, y):
+        """Return plate corner key ('p1'..'p4') if (x,y) hits one, else None."""
+        if self._view.get() != 'b' or not self._pvars:
+            return None
+        cs = self.CANVAS_SCALE
+        for pt in ('p1', 'p2', 'p3', 'p4'):
+            pv = self._pvars.get(pt, {})
+            cx = pv.get('tx', tk.DoubleVar()).get() * cs
+            cy = pv.get('ty', tk.DoubleVar()).get() * cs
+            if (x - cx)**2 + (y - cy)**2 <= self.HANDLE_HIT**2:
+                return pt
+        return None
+
     def _on_press(self, evt):
         self._cv.focus_set()
+        # Plate corners take priority (they sit on top in back view)
+        pt = self._hit_plate(evt.x, evt.y)
+        if pt:
+            self._drag_plate = pt
+            self._drag = None
+            self._cv.config(cursor='fleur')
+            return
         tire = self._hit_tire(evt.x, evt.y)
         if tire:
             self._drag = tire
+            self._drag_plate = None
             self._cv.config(cursor='fleur')
 
     def _nudge(self, dx, dy):
@@ -658,17 +682,32 @@ class WheelPreviewWindow(tk.Toplevel):
         self._render()
 
     def _on_drag(self, evt):
+        cs = self.CANVAS_SCALE
+
+        if self._drag_plate:
+            pt = self._drag_plate
+            pv = self._pvars.get(pt, {})
+            gx = max(0, min(self.STAGE_W, evt.x / cs))
+            gy = max(0, min(self.STAGE_H, evt.y / cs))
+            pv.get('tx', tk.DoubleVar()).set(round(gx))
+            pv.get('ty', tk.DoubleVar()).set(round(gy))
+            cx, cy = gx * cs, gy * cs
+            if pt in self._plate_cids:
+                oid, tid = self._plate_cids[pt]
+                r = 8
+                self._cv.coords(oid, cx-r, cy-r, cx+r, cy+r)
+                self._cv.coords(tid, cx, cy)
+            self._coord_lbl.config(text=f"Plate {pt}: x={round(gx)}  y={round(gy)}")
+            return
+
         if not self._drag:
             return
-        cs   = self.CANVAS_SCALE
         view = self._view.get()
-        # Convert canvas px → game coords, clamp to stage bounds
         gx = max(0, min(self.STAGE_W, evt.x / cs))
         gy = max(0, min(self.STAGE_H, evt.y / cs))
         key = (view, self._drag)
         self._wvars[key]['tx'].set(round(gx))
         self._wvars[key]['ty'].set(round(gy))
-        # Move circle in canvas space
         cx, cy = gx * cs, gy * cs
         oid, tid = self._cids[self._drag]
         r = self.HANDLE_R
@@ -678,6 +717,7 @@ class WheelPreviewWindow(tk.Toplevel):
 
     def _on_release(self, evt):
         self._drag = None
+        self._drag_plate = None
         self._cv.config(cursor='crosshair')
         self._render()
 
