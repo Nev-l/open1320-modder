@@ -3591,31 +3591,32 @@ class CarModderApp(tk.Tk):
 
         ctrl_fr = ttk.LabelFrame(decal_lf, text="Selected Decal", padding=4)
         ctrl_fr.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 4))
-        ctrl_fr.columnconfigure(1, weight=1); ctrl_fr.columnconfigure(3, weight=1)
+        ctrl_fr.columnconfigure(1, weight=1)
+        ctrl_fr.columnconfigure(3, weight=1)
 
-        ttk.Label(ctrl_fr, text="X:").grid(row=0, column=0, sticky="w")
-        self._decal_x = tk.IntVar(value=0)
-        tk.Spinbox(ctrl_fr, textvariable=self._decal_x, from_=-9999, to=9999, increment=1,
-                   width=6, bg="#16213e", fg=ACC, buttonbackground="#0f3460", relief="flat",
-                   command=self._sync_decal_props).grid(row=0, column=1, sticky="w", padx=(2, 8))
-        ttk.Label(ctrl_fr, text="Y:").grid(row=0, column=2, sticky="w")
-        self._decal_y = tk.IntVar(value=0)
-        tk.Spinbox(ctrl_fr, textvariable=self._decal_y, from_=-9999, to=9999, increment=1,
-                   width=6, bg="#16213e", fg=ACC, buttonbackground="#0f3460", relief="flat",
-                   command=self._sync_decal_props).grid(row=0, column=3, sticky="w", padx=(2, 0))
-
-        ttk.Label(ctrl_fr, text="Scale:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self._decal_x     = tk.IntVar(value=0)
+        self._decal_y     = tk.IntVar(value=0)
         self._decal_scale = tk.DoubleVar(value=1.0)
-        tk.Spinbox(ctrl_fr, textvariable=self._decal_scale, from_=0.05, to=10.0, increment=0.05,
-                   width=6, format="%.2f", bg="#16213e", fg=ACC, buttonbackground="#0f3460",
-                   relief="flat", command=self._sync_decal_props).grid(
-                   row=1, column=1, sticky="w", padx=(2, 8), pady=(4, 0))
-        ttk.Label(ctrl_fr, text="Opacity:").grid(row=1, column=2, sticky="w", pady=(4, 0))
         self._decal_alpha = tk.DoubleVar(value=1.0)
-        tk.Spinbox(ctrl_fr, textvariable=self._decal_alpha, from_=0.0, to=1.0, increment=0.05,
-                   width=6, format="%.2f", bg="#16213e", fg=ACC, buttonbackground="#0f3460",
-                   relief="flat", command=self._sync_decal_props).grid(
-                   row=1, column=3, sticky="w", padx=(2, 0), pady=(4, 0))
+
+        def _dslider(parent, row, label, var, lo, hi, fmt, col_off=0):
+            ttk.Label(parent, text=label).grid(row=row, column=col_off,
+                                               sticky="w", pady=(2, 0))
+            sl = tk.Scale(parent, variable=var, from_=lo, to=hi,
+                          orient='horizontal', length=130, bg=BG, fg=FG,
+                          troughcolor=DARK, showvalue=0, resolution=0.01 if fmt else 1,
+                          activebackground=ACC, highlightthickness=0,
+                          command=lambda *_: self._sync_decal_props())
+            sl.grid(row=row, column=col_off+1, sticky="ew", padx=(2, 4), pady=(2, 0))
+            ent = ttk.Entry(parent, textvariable=var, width=6)
+            ent.grid(row=row, column=col_off+2, sticky="w", pady=(2, 0))
+            ent.bind('<Return>',   lambda *_: self._sync_decal_props())
+            ent.bind('<FocusOut>', lambda *_: self._sync_decal_props())
+
+        _dslider(ctrl_fr, 0, "X:",       self._decal_x,     -2000, 2000,  False)
+        _dslider(ctrl_fr, 1, "Y:",       self._decal_y,     -2000, 2000,  False)
+        _dslider(ctrl_fr, 2, "Scale:",   self._decal_scale, 0.05,  5.0,   True)
+        _dslider(ctrl_fr, 3, "Opacity:", self._decal_alpha, 0.0,   1.0,   True)
 
         grp_fr = ttk.LabelFrame(decal_lf, text="Groups", padding=4)
         grp_fr.grid(row=3, column=0, columnspan=2, sticky="ew")
@@ -3853,18 +3854,20 @@ class CarModderApp(tk.Tk):
 
     def _draw_mod(self, slot: ImageSlot):
         """Composite and display the modified image. Runs the heavy work in a thread."""
+        # Read canvas size on main thread — Tkinter winfo_* are not thread-safe
+        w = max(self._c_mod.winfo_width(), 100)
+        h = max(self._c_mod.winfo_height(), 100)
         self._mod_info.config(text="Compositing…", foreground="#aaa")
-        threading.Thread(target=self._draw_mod_worker, args=(slot,), daemon=True).start()
+        threading.Thread(target=self._draw_mod_worker,
+                         args=(slot, w, h), daemon=True).start()
 
-    def _draw_mod_worker(self, slot: ImageSlot):
+    def _draw_mod_worker(self, slot: ImageSlot, w: int, h: int):
         try:
             img = slot.final_image()
         except Exception as e:
             self.after(0, lambda: self._mod_info.config(
                 text=f"Error: {e}", foreground="#e94560"))
             return
-        w = max(self._c_mod.winfo_width(), 100)
-        h = max(self._c_mod.winfo_height(), 100)
         thumb = img.copy()
         thumb.thumbnail((w, h), Image.LANCZOS)
         tk_img = ImageTk.PhotoImage(thumb)
@@ -3872,7 +3875,7 @@ class CarModderApp(tk.Tk):
                     if slot.custom_path else "")
 
         def _update():
-            self._tk_mod = tk_img   # keep reference alive
+            self._tk_mod = tk_img
             self._c_mod.delete("all")
             self._c_mod.create_image(w // 2, h // 2, image=self._tk_mod, anchor="center")
             self._mod_info.config(
@@ -4090,11 +4093,18 @@ class CarModderApp(tk.Tk):
         if not sel:
             return
         d = slot.decals[sel[0]]
-        d['x']     = self._decal_x.get()
-        d['y']     = self._decal_y.get()
-        d['scale'] = self._decal_scale.get()
-        d['alpha'] = self._decal_alpha.get()
-        self._draw_mod(slot)
+        try:
+            d['x']     = int(self._decal_x.get())
+            d['y']     = int(self._decal_y.get())
+            d['scale'] = float(self._decal_scale.get())
+            d['alpha'] = float(self._decal_alpha.get())
+        except (tk.TclError, ValueError):
+            return
+        # Debounce: cancel pending redraw and schedule a new one 80ms out
+        if hasattr(self, '_decal_draw_job') and self._decal_draw_job:
+            try: self.after_cancel(self._decal_draw_job)
+            except Exception: pass
+        self._decal_draw_job = self.after(80, lambda: self._draw_mod(slot))
 
     def _refresh_decal_lb(self):
         slot = self._sel
