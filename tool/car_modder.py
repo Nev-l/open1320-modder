@@ -2172,6 +2172,212 @@ class BadgeData:
     new_large:   str  | None = None # user-supplied large image path (or None = auto)
 
 
+# ── Rim Editor ────────────────────────────────────────────────────────────────
+
+class RimEditorFrame(ttk.Frame):
+    VIEWS     = [('FF', 'Front / Front wheel'), ('FR', 'Front / Rear wheel'),
+                 ('BF', 'Back / Front wheel'),  ('BR', 'Back / Rear wheel')]
+    THUMB     = 80
+    WHEEL_DIR = os.path.join(CACHE_DIR, "car", "wheel")
+
+    def __init__(self, parent, tmp_dir: str, **kw):
+        super().__init__(parent, **kw)
+        self._tmp      = tmp_dir
+        self._rim_id   = tk.IntVar(value=1)
+        self._new_id   = tk.IntVar(value=200)
+        self._previews: dict[str, Image.Image | None] = {v: None for v, _ in self.VIEWS}
+        self._custom:   dict[str, str | None]         = {v: None for v, _ in self.VIEWS}
+        self._hue = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
+        self._sat = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
+        self._bri = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
+        self._tk_imgs: list = []
+        self._build_ui()
+
+    # ── UI ─────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        # ── Top bar ────────────────────────────────────────────────────────────
+        top = ttk.Frame(self)
+        top.grid(row=0, column=0, sticky='ew', pady=(0, 6))
+
+        ttk.Label(top, text='Source Rim ID:').pack(side='left')
+        ttk.Spinbox(top, textvariable=self._rim_id, from_=1, to=300,
+                    width=5).pack(side='left', padx=(4, 0))
+        ttk.Button(top, text='Load', style='Accent.TButton',
+                   command=self._load_rim).pack(side='left', padx=(6, 0))
+
+        ttk.Separator(top, orient='vertical').pack(side='left', fill='y', padx=12)
+
+        ttk.Label(top, text='New Rim ID:').pack(side='left')
+        ttk.Spinbox(top, textvariable=self._new_id, from_=1, to=9999,
+                    width=6).pack(side='left', padx=(4, 0))
+        ttk.Button(top, text='Build & Save to Cache', style='Warn.TButton',
+                   command=self._build_rim).pack(side='left', padx=(6, 0))
+
+        self._status = ttk.Label(top, text='Load a rim to start editing.',
+                                  foreground='#aaa')
+        self._status.pack(side='left', padx=(12, 0))
+
+        # ── View panels ────────────────────────────────────────────────────────
+        views_fr = ttk.Frame(self)
+        views_fr.grid(row=1, column=0, sticky='nsew')
+        for ci in range(4):
+            views_fr.columnconfigure(ci, weight=1)
+        views_fr.rowconfigure(0, weight=1)
+
+        self._view_panels: dict[str, dict] = {}
+        for ci, (view, label) in enumerate(self.VIEWS):
+            lf = ttk.LabelFrame(views_fr, text=label, padding=6)
+            lf.grid(row=0, column=ci, sticky='nsew', padx=(0, 6) if ci < 3 else 0)
+            lf.rowconfigure(0, weight=1)
+            lf.columnconfigure(0, weight=1)
+
+            # Preview canvas
+            cv = tk.Canvas(lf, bg=DARK, width=160, height=160, highlightthickness=0)
+            cv.grid(row=0, column=0, pady=(0, 6))
+
+            # Colour sliders
+            def _slider(parent, var, label, row):
+                ttk.Label(parent, text=label, foreground='#888',
+                          font=('Segoe UI', 7)).grid(row=row, column=0, sticky='w')
+                sl = tk.Scale(parent, variable=var, from_=-180, to=180,
+                              orient='horizontal', length=150, bg=BG, fg=FG,
+                              troughcolor=DARK, showvalue=1, font=('Segoe UI', 7),
+                              activebackground=ACC, highlightthickness=0,
+                              command=lambda *_: self._refresh_preview(view))
+                sl.grid(row=row, column=1, padx=(4, 0))
+
+            _slider(lf, self._hue[view], 'Hue',  1)
+            _slider(lf, self._sat[view], 'Sat',  2)
+            _slider(lf, self._bri[view], 'Bri',  3)
+
+            # Buttons
+            btn_fr = ttk.Frame(lf)
+            btn_fr.grid(row=4, column=0, columnspan=2, sticky='ew', pady=(6, 0))
+            ttk.Button(btn_fr, text='Upload…',
+                       command=lambda v=view: self._upload(v)).pack(side='left', fill='x',
+                                                                     expand=True, padx=(0, 2))
+            ttk.Button(btn_fr, text='Reset',
+                       command=lambda v=view: self._reset_view(v)).pack(side='left')
+
+            self._view_panels[view] = {'cv': cv, 'lf': lf}
+
+    # ── Actions ────────────────────────────────────────────────────────────────
+
+    def _load_rim(self):
+        rim_id = self._rim_id.get()
+        self._tk_imgs.clear()
+        missing = []
+        for view, _ in self.VIEWS:
+            path = os.path.join(self.WHEEL_DIR, f"wheel{view}_{rim_id}.swf")
+            if not os.path.exists(path):
+                missing.append(view)
+                self._previews[view] = None
+                self._custom[view]   = None
+                self._view_panels[view]['lf'].configure(text=f'{view} — not found')
+                self._clear_canvas(view)
+                continue
+            out_dir = os.path.join(self._tmp, f"rim_{rim_id}_{view}")
+            imgs = export_all_images(path, out_dir)
+            if imgs:
+                img = Image.open(list(imgs.values())[0]).convert('RGBA')
+            else:
+                img = Image.new('RGBA', (160, 160), (30, 30, 30, 255))
+            self._previews[view] = img
+            self._custom[view]   = None
+            _, label = next((v, l) for v, l in self.VIEWS if v == view)
+            self._view_panels[view]['lf'].configure(text=label)
+            self._refresh_preview(view)
+        msg = f'Rim {rim_id} loaded.'
+        if missing:
+            msg += f'  (no {view} SWF: {", ".join(missing)})'
+        self._status.config(text=msg, foreground='#aaa')
+
+    def _refresh_preview(self, view: str):
+        src = self._previews.get(view)
+        if src is None:
+            return
+        custom_path = self._custom.get(view)
+        img = Image.open(custom_path).convert('RGBA') if custom_path else src.copy()
+        img = apply_color_adjustments(img,
+                                      self._hue[view].get(),
+                                      self._sat[view].get(),
+                                      self._bri[view].get())
+        img = img.resize((160, 160), Image.LANCZOS)
+        tkimg = ImageTk.PhotoImage(img)
+        self._tk_imgs.append(tkimg)
+        cv = self._view_panels[view]['cv']
+        cv.delete('all')
+        cv.create_image(0, 0, anchor='nw', image=tkimg)
+
+    def _clear_canvas(self, view: str):
+        cv = self._view_panels[view]['cv']
+        cv.delete('all')
+        cv.create_text(80, 80, text='N/A', fill='#333', font=('Segoe UI', 12))
+
+    def _upload(self, view: str):
+        path = filedialog.askopenfilename(
+            title=f'Replace rim {view} image',
+            filetypes=[('Images', '*.png *.jpg *.jpeg *.bmp *.webp'), ('All', '*.*')])
+        if not path:
+            return
+        self._custom[view] = path
+        self._refresh_preview(view)
+
+    def _reset_view(self, view: str):
+        self._custom[view] = None
+        self._hue[view].set(0)
+        self._sat[view].set(0)
+        self._bri[view].set(0)
+        self._refresh_preview(view)
+
+    def _build_rim(self):
+        new_id = self._new_id.get()
+        src_id = self._rim_id.get()
+        built, errors = [], []
+        for view, _ in self.VIEWS:
+            src_swf = os.path.join(self.WHEEL_DIR, f"wheel{view}_{src_id}.swf")
+            if not os.path.exists(src_swf):
+                errors.append(f'{view}:missing')
+                continue
+            out_dir = os.path.join(self._tmp, f"rim_{src_id}_{view}")
+            imgs = export_all_images(src_swf, out_dir)
+            if not imgs:
+                errors.append(f'{view}:no-img')
+                continue
+            char_id = list(imgs.keys())[0]
+            src = self._previews.get(view)
+            custom_path = self._custom.get(view)
+            if custom_path:
+                final = Image.open(custom_path).convert('RGBA')
+            elif src:
+                final = src.copy()
+            else:
+                errors.append(f'{view}:no-preview')
+                continue
+            final = apply_color_adjustments(final,
+                                            self._hue[view].get(),
+                                            self._sat[view].get(),
+                                            self._bri[view].get())
+            # Save as JPEG (matching original format)
+            tmp_img = os.path.join(self._tmp, f"rim_bld_{new_id}_{view}.jpg")
+            final.convert('RGB').save(tmp_img, 'JPEG', quality=95)
+            out_swf = os.path.join(self.WHEEL_DIR, f"wheel{view}_{new_id}.swf")
+            ok = replace_all_images_in_swf(src_swf, {char_id: tmp_img}, out_swf)
+            if ok:
+                built.append(f'wheel{view}_{new_id}.swf')
+            else:
+                errors.append(f'{view}:build-fail')
+
+        msg = f'Built rim {new_id}: {", ".join(built)}.'
+        if errors:
+            msg += f'  Errors: {", ".join(errors)}'
+        self._status.config(text=msg, foreground='#00c87a' if not errors else '#e94560')
+
+
 class BadgeEditorFrame(ttk.Frame):
     THUMB = 40
     PAD   = 5
@@ -2773,13 +2979,6 @@ class CarModderApp(tk.Tk):
         nb.add(car_tab, text="  Car Modder  ")
         self._build_car_tab(car_tab)
 
-        badge_tab = ttk.Frame(nb, padding=8)
-        nb.add(badge_tab, text="  Badge Editor  ")
-        badge_tab.columnconfigure(0, weight=1)
-        badge_tab.rowconfigure(0, weight=1)
-        self._badge_editor = BadgeEditorFrame(badge_tab, self._tmp)
-        self._badge_editor.grid(row=0, column=0, sticky="nsew")
-
         paint_tab = ttk.Frame(nb)
         nb.add(paint_tab, text="  Paint Lab  ")
         paint_tab.columnconfigure(0, weight=1)
@@ -2792,6 +2991,20 @@ class CarModderApp(tk.Tk):
             tmp_dir      = self._tmp,
         )
         self._paint_lab.grid(row=0, column=0, sticky="nsew")
+
+        rim_tab = ttk.Frame(nb, padding=4)
+        nb.add(rim_tab, text="  Rim Editor  ")
+        rim_tab.columnconfigure(0, weight=1)
+        rim_tab.rowconfigure(0, weight=1)
+        self._rim_editor = RimEditorFrame(rim_tab, self._tmp)
+        self._rim_editor.grid(row=0, column=0, sticky="nsew")
+
+        badge_tab = ttk.Frame(nb, padding=8)
+        nb.add(badge_tab, text="  Badge Editor  ")
+        badge_tab.columnconfigure(0, weight=1)
+        badge_tab.rowconfigure(0, weight=1)
+        self._badge_editor = BadgeEditorFrame(badge_tab, self._tmp)
+        self._badge_editor.grid(row=0, column=0, sticky="nsew")
 
         # Path info strip
         info = ttk.Frame(self)
