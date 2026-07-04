@@ -2651,7 +2651,9 @@ class RimEditorFrame(ttk.Frame):
             shown = 0
             for view, (img, path) in extracted.items():
                 self._previews[view] = img
-                self._custom[view]   = path
+                # _custom holds image-file paths for re-tinting; SWF paths can't be
+                # opened by PIL, so clear it and let _refresh_preview use _previews directly
+                self._custom.pop(view, None)
                 lbl = dict(self.VIEWS).get(view, view)
                 if img:
                     self._view_panels[view]['lf'].configure(text=f'{lbl} [custom]')
