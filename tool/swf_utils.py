@@ -208,6 +208,89 @@ def read_swf_bitmaps(swf_path: str) -> list[Image.Image]:
     return images
 
 
+def read_swf_bitmap_ids(swf_path: str) -> list[tuple[int, "Image.Image"]]:
+    """Like read_swf_bitmaps but also returns the SWF character ID for each bitmap.
+    Returns list of (char_id, PIL Image) sorted largest-first.
+    The char_id is needed to call replace_all_images_in_swf on the template."""
+    import io
+    data = open(swf_path, 'rb').read()
+    sig  = data[:3]
+    if sig == b'CWS':
+        body = zlib.decompress(data[8:])
+    elif sig == b'ZWS':
+        import lzma
+        body = lzma.decompress(data[12:])
+    elif sig == b'FWS':
+        body = data[8:]
+    else:
+        return []
+
+    nb = (body[0] >> 3) & 0x1f
+    i  = ((5 + nb * 4 + 7) // 8) + 4
+
+    pairs: list[tuple[int, "Image.Image"]] = []
+    while i < len(body) - 2:
+        rec      = struct.unpack_from('<H', body, i)[0]
+        tag_type = rec >> 6
+        tag_len  = rec & 0x3f
+        i += 2
+        if tag_len == 0x3f:
+            tag_len = struct.unpack_from('<i', body, i)[0]
+            i += 4
+        if tag_type == 0:
+            break
+        chunk = body[i:i + tag_len]
+        try:
+            cid = struct.unpack_from('<H', chunk, 0)[0] if tag_len >= 2 else 0
+            img = None
+            if tag_type in (21, 19) and tag_len > 2:
+                img = Image.open(io.BytesIO(chunk[2:])).convert('RGBA')
+            elif tag_type == 35 and tag_len > 6:
+                alpha_off = struct.unpack_from('<I', chunk, 2)[0]
+                jpeg_data = chunk[6:6 + alpha_off]
+                img = Image.open(io.BytesIO(jpeg_data)).convert('RGBA')
+                try:
+                    ab = zlib.decompress(chunk[6 + alpha_off:])
+                    w, h = img.size
+                    if len(ab) >= w * h:
+                        img.putalpha(Image.frombytes('L', (w, h), ab[:w * h]))
+                except Exception:
+                    pass
+            elif tag_type == 90 and tag_len > 8:
+                alpha_off = struct.unpack_from('<I', chunk, 2)[0]
+                jpeg_data = chunk[8:8 + alpha_off]
+                img = Image.open(io.BytesIO(jpeg_data)).convert('RGBA')
+                try:
+                    ab = zlib.decompress(chunk[8 + alpha_off:])
+                    w, h = img.size
+                    if len(ab) >= w * h:
+                        img.putalpha(Image.frombytes('L', (w, h), ab[:w * h]))
+                except Exception:
+                    pass
+            elif tag_type in (20, 36) and tag_len >= 7:
+                fmt     = chunk[2]
+                w       = struct.unpack_from('<H', chunk, 3)[0]
+                h       = struct.unpack_from('<H', chunk, 5)[0]
+                hdr_end = 7 + (1 if fmt == 3 else 0)
+                raw     = zlib.decompress(chunk[hdr_end:])
+                if fmt == 5 and len(raw) >= w * h * 4:
+                    arr = bytearray(raw[:w * h * 4])
+                    for p in range(0, len(arr), 4):
+                        arr[p], arr[p+1], arr[p+2], arr[p+3] = \
+                            arr[p+1], arr[p+2], arr[p+3], arr[p]
+                    img = Image.frombytes('RGBA', (w, h), bytes(arr))
+                elif fmt == 3 and len(raw) >= w * h:
+                    img = Image.frombytes('P', (w, h), raw[:w * h]).convert('RGBA')
+            if img is not None:
+                pairs.append((cid, img))
+        except Exception:
+            pass
+        i += tag_len
+
+    pairs.sort(key=lambda p: p[1].width * p[1].height, reverse=True)
+    return pairs
+
+
 def export_image(swf_path: str, out_dir: str) -> str | None:
     """Export the largest embedded image from a SWF. Returns file path or None.
     Tries FFDec first; falls back to direct DefineBitsLossless2 parsing."""
@@ -1057,6 +1140,132 @@ def patch_plate_bumper_swf(src_path: str, dst_path: str, corners: dict) -> bool:
                 _bit_write(data, ty_b, new_ty, nt)
             _walk_po2_in_sprite(data, ds, ds + tlen, _patch_cb)
         p = ds + tlen
+
+    try:
+        with open(dst_path, 'wb') as f:
+            f.write(data)
+        return True
+    except OSError:
+        return False
+
+
+def swf_has_paint_clip(path: str) -> bool:
+    """Return True if any DefineSprite in the SWF has a PlaceObject2 named 'paint'."""
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read()
+        data = bytearray(_swf_decompress(raw))
+    except OSError:
+        return False
+    return data.find(b'paint\x00') >= 0
+
+
+def ensure_paint_clip_in_swf(src_path: str, dst_path: str) -> bool:
+    """Ensure a visual SWF has a 'paint' clip inside its exported DefineSprite.
+
+    If the SWF already has a 'paint' PlaceObject2, nothing is changed.
+    If it has a 'noPaint' but no 'paint', the noPaint is renamed to 'paint'
+    in-place so the game's CarConstruction.initPart can find and colorize it.
+    The 'noPaint' rename is safe because initPart silently ignores missing noPaint.
+
+    Returns True if the file was modified, False if already correct or not applicable.
+    """
+    try:
+        with open(src_path, 'rb') as f:
+            raw = f.read()
+        data = bytearray(_swf_decompress(raw))
+    except OSError:
+        return False
+
+    if data.find(b'paint\x00') >= 0:
+        return False  # already has paint clip — nothing to do
+
+    # Find the exported DefineSprite (the one with an ExportAssets entry)
+    # and rename its first 'noPaint' PlaceObject2 to 'paint'
+    nbits = (data[8] >> 3) & 0x1F
+    p = 8 + (5 + 4 * nbits + 7) // 8 + 4
+
+    exported_ids: set[int] = set()
+    while p < len(data) - 1:
+        rh = struct.unpack_from('<H', data, p)[0]
+        tag_type, raw_len = rh >> 6, rh & 0x3F
+        if raw_len == 0x3F:
+            tlen = struct.unpack_from('<I', data, p + 2)[0]; ds = p + 6
+        else:
+            tlen, ds = raw_len, p + 2
+        if tag_type == 0:
+            break
+        if tag_type == 56:  # ExportAssets
+            count = struct.unpack_from('<H', data, ds)[0]
+            ep = ds + 2
+            for _ in range(count):
+                if ep + 2 > ds + tlen:
+                    break
+                exported_ids.add(struct.unpack_from('<H', data, ep)[0])
+                ep += 2
+                while ep < ds + tlen and data[ep] != 0:
+                    ep += 1
+                ep += 1
+        p = ds + tlen
+
+    # Now walk again, find a DefineSprite that is exported and lacks 'paint'
+    p = 8 + (5 + 4 * nbits + 7) // 8 + 4
+    changed = False
+
+    while p < len(data) - 1:
+        rh = struct.unpack_from('<H', data, p)[0]
+        tag_type, raw_len = rh >> 6, rh & 0x3F
+        if raw_len == 0x3F:
+            tlen = struct.unpack_from('<I', data, p + 2)[0]; ds = p + 6
+        else:
+            tlen, ds = raw_len, p + 2
+        if tag_type == 0:
+            break
+
+        if tag_type == 39:  # DefineSprite
+            sprite_id = struct.unpack_from('<H', data, ds)[0]
+            if sprite_id not in exported_ids:
+                p = ds + tlen
+                continue
+
+            # Walk inner PlaceObject2 tags looking for 'noPaint' to rename
+            sp = ds + 4
+            while sp < ds + tlen:
+                rh2 = struct.unpack_from('<H', data, sp)[0]
+                st, srl = rh2 >> 6, rh2 & 0x3F
+                if srl == 0x3F:
+                    stlen = struct.unpack_from('<I', data, sp + 2)[0]; sds = sp + 6
+                else:
+                    stlen, sds = srl, sp + 2
+                if st == 0:
+                    break
+                if st == 26:  # PlaceObject2
+                    flags = data[sds]
+                    off = sds + 3  # flags + depth
+                    if flags & 0x02:
+                        off += 2  # char_id
+                    if flags & 0x04:
+                        _, _, _, _, _, off = _swf_matrix_info(data, off)
+                    if flags & 0x08:
+                        off += 4  # color transform
+                    if flags & 0x10:
+                        off += 2  # ratio
+                    if flags & 0x20:  # has name
+                        ne = data.index(0, off)
+                        name = data[off:ne].decode('ascii', 'ignore')
+                        if name == 'noPaint':
+                            # Replace "noPaint\0" (8 bytes) with "paint\0\0\0" (8 bytes)
+                            data[off:off + 8] = b'paint\x00\x00\x00'
+                            changed = True
+                            break
+                sp = sds + stlen
+            if changed:
+                break
+
+        p = ds + tlen
+
+    if not changed:
+        return False
 
     try:
         with open(dst_path, 'wb') as f:

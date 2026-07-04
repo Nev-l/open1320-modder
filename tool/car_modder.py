@@ -2,7 +2,7 @@
 1320 Legends Car Modder
 Per-part image editing, custom image upload, overlay alignment, and badge editor.
 """
-VERSION = "0.3.0"
+VERSION = "0.3.5"
 import os, sys, shutil, tempfile, threading, math, dataclasses, json, tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk, ImageDraw
@@ -67,7 +67,8 @@ from swf_utils import (get_package_info, list_visual_swfs, export_image,
                         set_ffdec_path, find_ffdec_default, build_part_swf,
                         parse_tire_swf, patch_tire_swf, swf_rect_origin,
                         parse_plate_bumper_swf, patch_plate_bumper_swf,
-                        read_swf_info)
+                        read_swf_info, swf_has_paint_clip, ensure_paint_clip_in_swf,
+                        read_swf_bitmap_ids)
 from color_utils import apply_color_adjustments, apply_rim_tint
 
 CONFIG_FILE = os.path.join(BASE_DIR, "1320modder_config.json")
@@ -2907,48 +2908,64 @@ class RimEditorFrame(ttk.Frame):
     def _build_rim(self):
         new_id = self._new_id.get()
         src_id = self._rim_id.get()
+        # Snapshot all tkinter vars and mutable dicts on the main thread — worker thread
+        # must not call tkinter .get() methods or it may read stale values (Tcl is not
+        # thread-safe) and silently produce untinted output for the first view.
+        params = {
+            view: {
+                'color':    self._tint_color.get(view, '#ffffff'),
+                'strength': self._tint_str[view].get() / 100.0,
+                'bri':      self._bri[view].get() / 100.0,
+                'preview':  self._previews.get(view),
+                'custom':   self._custom.get(view),
+            }
+            for view, _ in self.VIEWS
+        }
         self._status.config(text=f'Building rim {new_id}…', foreground='#aaa')
         threading.Thread(target=self._build_worker,
-                         args=(src_id, new_id), daemon=True).start()
+                         args=(src_id, new_id, params), daemon=True).start()
 
-    def _build_worker(self, src_id: int, new_id: int):
+    def _build_worker(self, src_id: int, new_id: int, params: dict):
         built, errors = [], []
         for view, _ in self.VIEWS:
             src_swf = os.path.join(self.WHEEL_DIR, f"wheel{view}_{src_id}.swf")
             if not os.path.exists(src_swf):
                 errors.append(f'{view}:no-source')
                 continue
-            # Get char_id by exporting first
             out_dir = os.path.join(self._tmp, f"rim_{src_id}_{view}")
             imgs = export_all_images(src_swf, out_dir)
             if not imgs:
                 errors.append(f'{view}:no-img')
                 continue
-            char_id = list(imgs.keys())[0]
-            src_img = self._previews.get(view)
-            custom_path = self._custom.get(view)
+            # Use the largest exported image's char_id — matches what export_image() picks
+            char_id = max(imgs, key=lambda k: os.path.getsize(imgs[k]))
+            p         = params[view]
+            src_img   = p['preview']
+            custom_path = p['custom']
             if custom_path:
-                final = Image.open(custom_path).convert('RGBA')
+                base = Image.open(custom_path).convert('RGBA')
             elif src_img:
-                final = src_img.copy()
+                base = src_img.copy()
             else:
                 errors.append(f'{view}:no-preview')
                 continue
-            final = apply_rim_tint(final,
-                                   color_hex=self._tint_color.get(view, '#ffffff'),
-                                   strength=self._tint_str[view].get() / 100.0,
-                                   brightness_delta=self._bri[view].get() / 100.0)
+            final = apply_rim_tint(base,
+                                   color_hex=p['color'],
+                                   strength=p['strength'],
+                                   brightness_delta=p['bri'])
             tmp_img = os.path.join(self._tmp, f"rim_bld_{new_id}_{view}.png")
             final.save(tmp_img, 'PNG')
             out_swf = os.path.join(self.WHEEL_DIR, f"wheel{view}_{new_id}.swf")
             ok = replace_all_images_in_swf(src_swf, {char_id: tmp_img}, out_swf)
             if ok:
                 built.append(f'wheel{view}_{new_id}.swf')
-                # Update in-memory and disk caches so browser/previews show the modified image
-                _RIM_MEM[(view, new_id)] = final.copy()
+                # Cache the pre-tint base image so reloading this slot doesn't
+                # compound tints on the next build (the SWF has the tinted version;
+                # _previews should always hold the untinted base for editing).
+                _RIM_MEM[(view, new_id)] = base.copy()
                 disk_png = os.path.join(RIM_CACHE_DIR, f"{view}_{new_id}.png")
                 try:
-                    final.save(disk_png, 'PNG')
+                    base.save(disk_png, 'PNG')
                 except Exception:
                     pass
             else:
@@ -3568,6 +3585,924 @@ class BadgeEditorFrame(ttk.Frame):
         return out
 
 
+# ── Part Builder ──────────────────────────────────────────────────────────────
+
+class PartBuilderFrame(ttk.Frame):
+    """Visual part builder.
+
+    Pick an existing car part SWF as a template, load your custom image, drag to
+    align it over the reference, then Build to produce a ready-to-use SWF.
+    The output SWF is structurally identical to the template (same stage size,
+    same paint clips) — only the bitmap is replaced.
+    """
+
+    # SWFs that carry no paintable visual — skip in the part-type list
+    _SKIP = {'decalLoader', 'tireF', 'tireR', 'tireBack',
+             'wheelMaskAddF', 'wheelMaskAddR', 'shadow'}
+
+    def __init__(self, parent, tmp_dir: str, get_slots=None):
+        super().__init__(parent)
+        self._tmp           = tmp_dir
+        self._get_slots     = get_slots   # callable → list[ImageSlot] from Car Modder tab
+        self._template_swf: str | None         = None
+        self._template_img: Image.Image | None = None
+        self._template_bw   = 0
+        self._template_bh   = 0
+        self._template_sw   = 0
+        self._template_sh   = 0
+        self._template_cid  = 1
+        self._user_img: Image.Image | None     = None
+        self._parts_map: dict[str, list[str]]  = {}
+        # canvas state
+        self._mode        = tk.StringVar(value='align')
+        self._zoom        = 1.0
+        self._ref_opa     = tk.DoubleVar(value=0.45)
+        self._usr_x       = tk.IntVar(value=0)
+        self._usr_y       = tk.IntVar(value=0)
+        self._usr_scale   = tk.DoubleVar(value=100.0)
+        self._drag_start  = None
+        self._drag_origin = None
+        self._tk_img      = None   # keep reference to prevent GC
+
+        self._build_ui()
+        # Trace scale/offset spinboxes so typing a value also re-renders
+        for v in (self._usr_x, self._usr_y, self._usr_scale):
+            v.trace_add('write', lambda *_: self._render())
+        self.after(100, self._scan_parts)
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        # ── LEFT PANEL ────────────────────────────────────────────────────────
+        left = ttk.Frame(self, padding=(8, 8, 4, 8))
+        left.grid(row=0, column=0, sticky='ns')
+        left.columnconfigure(0, weight=1)
+
+        # 1. Template SWF
+        tpl = ttk.LabelFrame(left, text="1 · Template SWF", padding=8)
+        tpl.pack(fill='x')
+        tpl.columnconfigure(1, weight=1)
+
+        ttk.Label(tpl, text="Part type:").grid(row=0, column=0, sticky='w')
+        self._part_var = tk.StringVar()
+        self._part_cb  = ttk.Combobox(tpl, textvariable=self._part_var,
+                                       state='readonly', width=16)
+        self._part_cb.grid(row=0, column=1, sticky='ew', padx=(4, 0))
+        self._part_cb.bind('<<ComboboxSelected>>', self._on_part_change)
+
+        ttk.Label(tpl, text="From car:").grid(row=1, column=0, sticky='w', pady=(4, 0))
+        self._car_var  = tk.StringVar()
+        self._car_cb   = ttk.Combobox(tpl, textvariable=self._car_var,
+                                       state='readonly', width=16)
+        self._car_cb.grid(row=1, column=1, sticky='ew', padx=(4, 0), pady=(4, 0))
+        self._car_cb.bind('<<ComboboxSelected>>', self._on_car_change)
+
+        ttk.Button(tpl, text="Browse any SWF…",
+                   command=self._browse_template).grid(
+                   row=2, column=0, columnspan=2, sticky='ew', pady=(4, 0))
+
+        self._tpl_cv  = tk.Canvas(tpl, width=120, height=70,
+                                   bg='#111', highlightthickness=0)
+        self._tpl_cv.grid(row=3, column=0, columnspan=2, pady=(6, 0))
+        self._tpl_lbl = ttk.Label(tpl, text="No template loaded",
+                                   foreground='#555', font=('Segoe UI', 7),
+                                   justify='center')
+        self._tpl_lbl.grid(row=4, column=0, columnspan=2)
+
+        # 2. Your Image
+        img_lf = ttk.LabelFrame(left, text="2 · Your Image", padding=8)
+        img_lf.pack(fill='x', pady=(8, 0))
+        img_lf.columnconfigure(1, weight=1)
+
+        self._img_path_var = tk.StringVar()
+        ttk.Entry(img_lf, textvariable=self._img_path_var, state='readonly',
+                  font=('Segoe UI', 7)).grid(row=0, column=0, columnspan=2,
+                                              sticky='ew', pady=(0, 4))
+        ttk.Button(img_lf, text="Browse image…",
+                   command=self._browse_image).grid(
+                   row=1, column=0, columnspan=2, sticky='ew')
+
+        sc_fr = ttk.Frame(img_lf)
+        sc_fr.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6, 0))
+        ttk.Label(sc_fr, text="Scale %:").pack(side='left')
+        tk.Spinbox(sc_fr, textvariable=self._usr_scale,
+                   from_=1, to=2000, increment=1, width=6,
+                   bg="#16213e", fg=ACC, buttonbackground="#0f3460", relief="flat",
+                   font=("Consolas", 9)).pack(side='left', padx=(4, 0))
+
+        off_fr = ttk.Frame(img_lf)
+        off_fr.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(4, 0))
+        ttk.Label(off_fr, text="X:").pack(side='left')
+        tk.Spinbox(off_fr, textvariable=self._usr_x,
+                   from_=-9999, to=9999, width=6,
+                   bg="#16213e", fg=ACC, buttonbackground="#0f3460", relief="flat",
+                   font=("Consolas", 9)).pack(side='left', padx=(2, 8))
+        ttk.Label(off_fr, text="Y:").pack(side='left')
+        tk.Spinbox(off_fr, textvariable=self._usr_y,
+                   from_=-9999, to=9999, width=6,
+                   bg="#16213e", fg=ACC, buttonbackground="#0f3460", relief="flat",
+                   font=("Consolas", 9)).pack(side='left', padx=(2, 0))
+
+        act_fr = ttk.Frame(img_lf)
+        act_fr.grid(row=4, column=0, columnspan=2, sticky='ew', pady=(4, 0))
+        ttk.Button(act_fr, text="Auto-fit",
+                   command=self._auto_fit).pack(side='left', padx=(0, 4))
+        ttk.Button(act_fr, text="Center",
+                   command=self._center_img).pack(side='left', padx=(0, 4))
+        ttk.Button(act_fr, text="Reset",
+                   command=self._reset_transform).pack(side='left')
+
+        ref_fr = ttk.Frame(img_lf)
+        ref_fr.grid(row=5, column=0, columnspan=2, sticky='ew', pady=(6, 0))
+        ttk.Label(ref_fr, text="Ref opacity:").pack(side='left')
+        ttk.Scale(ref_fr, variable=self._ref_opa, from_=0, to=1, orient='horizontal',
+                  command=lambda _: self._render(), length=90).pack(side='left', padx=(4, 0))
+
+        # 3. Build
+        bld = ttk.LabelFrame(left, text="3 · Build", padding=8)
+        bld.pack(fill='x', pady=(8, 0))
+        bld.columnconfigure(1, weight=1)
+
+        ttk.Label(bld, text="Output:").grid(row=0, column=0, sticky='w')
+        self._out_var = tk.StringVar()
+        ttk.Entry(bld, textvariable=self._out_var).grid(
+            row=0, column=1, sticky='ew', padx=(4, 4))
+        ttk.Button(bld, text="…", command=self._browse_out).grid(row=0, column=2)
+
+        ttk.Button(bld, text="Build SWF", style="Accent.TButton",
+                   command=self._build).grid(
+                   row=1, column=0, columnspan=3, sticky='ew', pady=(6, 0))
+        self._bld_lbl = ttk.Label(bld, text="", foreground='#666',
+                                   font=('Segoe UI', 8))
+        self._bld_lbl.grid(row=2, column=0, columnspan=3, sticky='w', pady=(2, 0))
+
+        # ── RIGHT CANVAS ──────────────────────────────────────────────────────
+        right = ttk.Frame(self, padding=(4, 8, 8, 8))
+        right.grid(row=0, column=1, sticky='nsew')
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        hdr = ttk.Frame(right)
+        hdr.grid(row=0, column=0, sticky='ew', pady=(0, 4))
+        self._cv_hint = ttk.Label(hdr, text="Load a template to start",
+                                   foreground='#555', font=('Segoe UI', 8))
+        self._cv_hint.pack(side='left')
+        ttk.Button(hdr, text="Fit view", command=self._fit).pack(side='right', padx=(4, 0))
+        # Mode toggle — Align view vs Car preview
+        ttk.Radiobutton(hdr, text="Car preview", variable=self._mode, value='car',
+                        command=self._render).pack(side='right', padx=(0, 8))
+        ttk.Radiobutton(hdr, text="Align view", variable=self._mode, value='align',
+                        command=self._render).pack(side='right')
+
+        cv_outer = ttk.Frame(right, relief='sunken', borderwidth=1)
+        cv_outer.grid(row=1, column=0, sticky='nsew')
+        cv_outer.rowconfigure(0, weight=1)
+        cv_outer.columnconfigure(0, weight=1)
+
+        self._cv = tk.Canvas(cv_outer, bg='#0a0a18', highlightthickness=0, cursor='fleur')
+        self._cv.grid(row=0, column=0, sticky='nsew')
+        self._cv.bind('<ButtonPress-1>',  self._on_press)
+        self._cv.bind('<B1-Motion>',       self._on_drag)
+        self._cv.bind('<ButtonRelease-1>', self._on_release)
+        self._cv.bind('<MouseWheel>',      self._on_scroll)
+        self._cv.bind('<Left>',  lambda e: self._nudge(-1, 0))
+        self._cv.bind('<Right>', lambda e: self._nudge(1, 0))
+        self._cv.bind('<Up>',    lambda e: self._nudge(0, -1))
+        self._cv.bind('<Down>',  lambda e: self._nudge(0, 1))
+        self._cv.bind('<ButtonPress-1>', lambda e: self._cv.focus_set(), add='+')
+        self._cv.bind('<Configure>', lambda e: self._render())
+
+    # ── Part / car scan ───────────────────────────────────────────────────────
+
+    def _scan_parts(self):
+        if not os.path.isdir(PACKAGES_DIR):
+            return
+        parts: dict[str, list[str]] = {}
+        for pkg in sorted(os.listdir(PACKAGES_DIR)):
+            pkg_dir = os.path.join(PACKAGES_DIR, pkg)
+            if not os.path.isdir(pkg_dir):
+                continue
+            for swf in os.listdir(pkg_dir):
+                if swf.endswith('.swf'):
+                    name = swf[:-4]
+                    if name not in self._SKIP:
+                        parts.setdefault(name, []).append(pkg)
+        self._parts_map = parts
+        sorted_names = sorted(parts.keys())
+        self._part_cb['values'] = sorted_names
+        default = 'hood' if 'hood' in parts else (sorted_names[0] if sorted_names else '')
+        if default:
+            self._part_var.set(default)
+            self._on_part_change()
+
+    def _on_part_change(self, *_):
+        part = self._part_var.get()
+        cars = sorted(self._parts_map.get(part, []))
+        self._car_cb['values'] = cars
+        if cars:
+            self._car_var.set(cars[0])
+            self._on_car_change()
+
+    def _on_car_change(self, *_):
+        car, part = self._car_var.get(), self._part_var.get()
+        if car and part:
+            swf = os.path.join(PACKAGES_DIR, car, f'{part}.swf')
+            if os.path.exists(swf):
+                self._load_template(swf)
+
+    def _browse_template(self):
+        path = filedialog.askopenfilename(
+            title="Select template SWF",
+            filetypes=[("SWF files", "*.swf"), ("All files", "*.*")],
+            initialdir=PACKAGES_DIR, parent=self)
+        if path:
+            self._load_template(path)
+
+    def _load_template(self, path: str):
+        self._template_swf = path
+        self._tpl_lbl.config(text="Loading…", foreground='#aaa')
+        self._tpl_cv.delete("all")
+
+        def worker():
+            try:
+                pairs      = read_swf_bitmap_ids(path)
+                sw, sh, _, _, _ = read_swf_info(path)
+            except Exception as e:
+                self.after(0, lambda: self._tpl_lbl.config(
+                    text=f"Error: {e}", foreground='#e94560'))
+                return
+            self.after(0, lambda: self._set_template(pairs, sw, sh, path))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _set_template(self, pairs, sw, sh, path):
+        if not pairs:
+            self._tpl_lbl.config(text="No bitmap found in SWF", foreground='#e94560')
+            return
+        cid, img            = pairs[0]
+        self._template_img  = img
+        self._template_bw, self._template_bh = img.size
+        self._template_sw   = sw or self._template_bw
+        self._template_sh   = sh or self._template_bh
+        self._template_cid  = cid
+        bname = os.path.basename(path)
+        self._tpl_lbl.config(
+            text=f"{bname}\nStage {self._template_sw}×{self._template_sh}"
+                 f"   Bitmap {self._template_bw}×{self._template_bh}   char {cid}",
+            foreground='#aaa')
+        thumb = img.copy()
+        thumb.thumbnail((120, 70), Image.LANCZOS)
+        tw, th = thumb.size
+        self._tpl_thumb = ImageTk.PhotoImage(thumb)
+        self._tpl_cv.create_image(60, 35, anchor='center', image=self._tpl_thumb)
+        if not self._out_var.get():
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            self._out_var.set(os.path.join(OUTPUT_DIR, bname))
+        self._fit()
+
+    # ── Image helpers ─────────────────────────────────────────────────────────
+
+    def _browse_image(self):
+        path = filedialog.askopenfilename(
+            title="Select your part image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All", "*.*")],
+            parent=self)
+        if not path:
+            return
+        try:
+            self._user_img = Image.open(path).convert("RGBA")
+            self._img_path_var.set(path)
+        except Exception as e:
+            messagebox.showerror("Error", str(e), parent=self)
+            return
+        self._auto_fit()
+        self._render()
+
+    def _auto_fit(self):
+        if not self._user_img or not self._template_bw:
+            return
+        sc = min(self._template_bw / self._user_img.width,
+                 self._template_bh / self._user_img.height) * 100.0
+        self._usr_scale.set(round(sc, 1))
+        self._usr_x.set(0)
+        self._usr_y.set(0)
+        self._render()
+
+    def _center_img(self):
+        if not self._user_img or not self._template_bw:
+            return
+        sc  = self._usr_scale.get() / 100.0
+        uw  = int(self._user_img.width  * sc)
+        uh  = int(self._user_img.height * sc)
+        self._usr_x.set((self._template_bw - uw) // 2)
+        self._usr_y.set((self._template_bh - uh) // 2)
+        self._render()
+
+    def _reset_transform(self):
+        self._usr_x.set(0)
+        self._usr_y.set(0)
+        self._usr_scale.set(100.0)
+        self._render()
+
+    # ── Canvas rendering ──────────────────────────────────────────────────────
+
+    def _fit(self, *_):
+        cw, ch = self._cv.winfo_width(), self._cv.winfo_height()
+        if cw < 10 or ch < 10 or not self._template_sw:
+            self._zoom = 1.0
+        else:
+            self._zoom = min(cw / self._template_sw, ch / self._template_sh) * 0.92
+        self._render()
+
+    def _on_scroll(self, event):
+        self._zoom = max(0.1, min(6.0, self._zoom * (1.1 if event.delta > 0 else 0.9)))
+        self._render()
+
+    def _render(self, *_):
+        if self._mode.get() == 'car':
+            self._render_car_preview()
+        else:
+            self._render_align()
+
+    def _render_align(self, *_):
+        """Align view: template reference in background + your image on top."""
+        cw, ch = self._cv.winfo_width(), self._cv.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        try:
+            self._usr_scale.get()
+            self._usr_x.get()
+            self._usr_y.get()
+        except tk.TclError:
+            return
+
+        z  = self._zoom
+        sw = max(1, int((self._template_sw or 640) * z))
+        sh = max(1, int((self._template_sh or 400) * z))
+        ox = (cw - sw) // 2
+        oy = (ch - sh) // 2
+
+        canvas = Image.new("RGBA", (cw, ch), (10, 10, 24, 255))
+
+        # Stage boundary
+        stg = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+        d   = ImageDraw.Draw(stg)
+        d.rectangle([ox, oy, ox + sw - 1, oy + sh - 1],
+                    outline=(50, 60, 110, 200), width=1)
+        canvas = Image.alpha_composite(canvas, stg)
+
+        # Template reference (dimmed)
+        if self._template_img:
+            ref = self._template_img.copy()
+            if ref.size != (sw, sh):
+                ref = ref.resize((sw, sh), Image.LANCZOS)
+            opa = self._ref_opa.get()
+            if opa < 1.0:
+                r, g, b, a = ref.split()
+                a = a.point(lambda v: int(v * opa))
+                ref = Image.merge("RGBA", (r, g, b, a))
+            layer = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+            layer.paste(ref, (ox, oy))
+            canvas = Image.alpha_composite(canvas, layer)
+
+        # User image with cyan outline
+        if self._user_img:
+            sc = self._usr_scale.get() / 100.0
+            uw = max(1, int(self._user_img.width  * sc * z))
+            uh = max(1, int(self._user_img.height * sc * z))
+            px = ox + int(self._usr_x.get() * z)
+            py = oy + int(self._usr_y.get() * z)
+            usr = self._user_img.resize((uw, uh), Image.LANCZOS)
+            frame = Image.new("RGBA", (uw + 2, uh + 2), (0, 0, 0, 0))
+            fd = ImageDraw.Draw(frame)
+            fd.rectangle([0, 0, uw + 1, uh + 1], outline=(0, 210, 255, 230), width=1)
+            frame.alpha_composite(usr, dest=(1, 1))
+            layer2 = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+            dx, dy = px - 1, py - 1
+            sx, sy = max(0, -dx), max(0, -dy)
+            dx, dy = max(0, dx), max(0, dy)
+            src_crop = frame.crop((sx, sy, frame.width, frame.height))
+            if src_crop.width > 0 and src_crop.height > 0:
+                layer2.alpha_composite(src_crop, dest=(dx, dy))
+            canvas = Image.alpha_composite(canvas, layer2)
+
+        # Info overlay
+        di = ImageDraw.Draw(canvas)
+        if self._template_sw:
+            di.text((ox + 3, oy + 3),
+                    f"Stage {self._template_sw}×{self._template_sh}  "
+                    f"  Bitmap {self._template_bw}×{self._template_bh}",
+                    fill=(60, 75, 130, 210))
+        if self._user_img:
+            sc2 = self._usr_scale.get() / 100.0
+            uw2 = int(self._user_img.width  * sc2)
+            uh2 = int(self._user_img.height * sc2)
+            di.text((ox + 3, oy + sh - 14),
+                    f"Your image {uw2}×{uh2}   offset {self._usr_x.get()},{self._usr_y.get()}",
+                    fill=(60, 75, 130, 210))
+
+        self._tk_img = ImageTk.PhotoImage(canvas)
+        self._cv.delete("all")
+        self._cv.create_image(0, 0, anchor='nw', image=self._tk_img)
+        if self._template_sw:
+            self._cv_hint.config(
+                text=f"zoom {z:.2f}×   drag to position   arrow keys nudge 1px   scroll to zoom",
+                foreground=ACC)
+
+    def _render_car_preview(self):
+        """Car preview: composite the full loaded car with the custom part swapped in."""
+        if not self._get_slots:
+            self._cv_hint.config(
+                text="Car preview not available — no car context",
+                foreground='#e94560')
+            return
+
+        cw, ch = self._cv.winfo_width(), self._cv.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+
+        self._cv_hint.config(text="Rendering car preview…", foreground='#aaa')
+
+        part_type  = self._part_var.get().lower()
+        user_img   = self._user_img
+        sc         = self._usr_scale.get() / 100.0
+        ux, uy     = self._usr_x.get(), self._usr_y.get()
+        bw, bh     = self._template_bw, self._template_bh
+        tpl_swf    = self._template_swf
+
+        _SKIP_LOWER = {'tiref', 'tirer', 'tireback', 'wheelmaskaddf', 'wheelmaskadd',
+                       'decalloader', 'shadow'}
+        _FG_ORDER   = ['undercarriage', 'bumperrear', 'bumper', 'body',
+                       'line', 'hood', 'roofeffect', 'roof', 'spoiler', 'trunk',
+                       'skirt', 'grille', 'lights', 'cPillarEffect', 'taillights', 'top']
+
+        def layer_key(p):
+            n = os.path.basename(p).lower()
+            for i, k in enumerate(_FG_ORDER):
+                if k.lower() in n:
+                    return i
+            return len(_FG_ORDER)
+
+        def worker():
+            try:
+                slots = self._get_slots()
+                if not slots:
+                    self.after(0, lambda: self._cv_hint.config(
+                        text="No car loaded — load a car in the Car Modder tab first",
+                        foreground='#e94560'))
+                    return
+
+                # Detect view direction from template SWF path (packageXXf → F, packageXXb → B)
+                pkg = os.path.basename(os.path.dirname(tpl_swf or ''))
+                view_char = 'b' if pkg.endswith('b') else 'f'
+                view_tag  = f"[{view_char.upper()}]"
+
+                # Build composited user image at template bitmap dimensions
+                user_composite = None
+                if user_img and bw and bh:
+                    uw = max(1, int(user_img.width  * sc))
+                    uh = max(1, int(user_img.height * sc))
+                    scaled = user_img.resize((uw, uh), Image.LANCZOS)
+                    user_composite = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+                    user_composite.paste(scaled, (ux, uy), scaled)
+
+                # Collect one slot per unique SWF, filtered to current view
+                seen: dict[str, object] = {}
+                for s in slots:
+                    if view_tag in s.label and s.swf_path not in seen:
+                        fname_l = os.path.basename(s.swf_path).lower().replace('.swf', '')
+                        if fname_l not in _SKIP_LOWER:
+                            seen[s.swf_path] = s
+
+                if not seen:
+                    self.after(0, lambda: self._cv_hint.config(
+                        text=f"No {view_tag} parts in loaded car — load a car first",
+                        foreground='#e94560'))
+                    return
+
+                STAGE_W, STAGE_H = 640, 400
+                composite = Image.new("RGBA", (STAGE_W, STAGE_H), (0, 0, 0, 0))
+
+                for swf_path in sorted(seen.keys(), key=layer_key):
+                    slot = seen[swf_path]
+                    fname_l = os.path.basename(swf_path).lower().replace('.swf', '')
+                    is_our  = bool(part_type and part_type in fname_l)
+
+                    if is_our and user_composite is not None:
+                        img = user_composite
+                    else:
+                        try:
+                            img = slot.final_image()
+                        except Exception:
+                            continue
+
+                    ox = oy = 0
+                    try:
+                        sw_px, sh_px, _, ox, oy = read_swf_info(swf_path)
+                        if is_our and user_composite is not None:
+                            # Resize custom composite to match this slot's expected size
+                            if img.size != (sw_px, sh_px):
+                                img = img.resize((sw_px, sh_px), Image.LANCZOS)
+                        elif img.width != sw_px or img.height != sh_px:
+                            img = img.resize((sw_px, sh_px), Image.LANCZOS)
+                    except Exception:
+                        pass
+
+                    composite.paste(img, (ox, oy), img)
+
+                # Scale composite to fit canvas
+                zoom = min(cw / STAGE_W, ch / STAGE_H) * 0.95
+                rw   = int(STAGE_W * zoom)
+                rh   = int(STAGE_H * zoom)
+                disp = composite.resize((rw, rh), Image.LANCZOS)
+                full = Image.new("RGBA", (cw, ch), (10, 10, 24, 255))
+                full.paste(disp, ((cw - rw) // 2, (ch - rh) // 2), disp)
+
+                tkimg   = ImageTk.PhotoImage(full)
+                pt_name = part_type.capitalize()
+                swapped = "· custom part overlaid" if user_composite else "· no image yet"
+                msg     = f"Car preview  {view_tag}  {swapped}   (switch to Align view to reposition)"
+
+                def _update():
+                    self._tk_img = tkimg
+                    self._cv.delete("all")
+                    self._cv.create_image(0, 0, anchor='nw', image=self._tk_img)
+                    self._cv_hint.config(text=msg, foreground=ACC)
+
+                self.after(0, _update)
+
+            except Exception as e:
+                self.after(0, lambda: self._cv_hint.config(
+                    text=f"Preview error: {e}", foreground='#e94560'))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ── Drag ──────────────────────────────────────────────────────────────────
+
+    def _on_press(self, event):
+        self._drag_start  = (event.x, event.y)
+        self._drag_origin = (self._usr_x.get(), self._usr_y.get())
+
+    def _on_drag(self, event):
+        if not self._drag_start:
+            return
+        dx = (event.x - self._drag_start[0]) / self._zoom
+        dy = (event.y - self._drag_start[1]) / self._zoom
+        self._usr_x.set(int(self._drag_origin[0] + dx))
+        self._usr_y.set(int(self._drag_origin[1] + dy))
+        self._render()
+
+    def _on_release(self, event):
+        self._drag_start  = None
+        self._drag_origin = None
+
+    def _nudge(self, dx, dy):
+        self._usr_x.set(self._usr_x.get() + dx)
+        self._usr_y.set(self._usr_y.get() + dy)
+        self._render()
+
+    # ── Output / Build ────────────────────────────────────────────────────────
+
+    def _browse_out(self):
+        path = filedialog.asksaveasfilename(
+            title="Save part SWF as",
+            defaultextension=".swf",
+            filetypes=[("SWF files", "*.swf"), ("All files", "*.*")],
+            initialdir=OUTPUT_DIR, parent=self)
+        if path:
+            self._out_var.set(path)
+
+    def _build(self):
+        tpl = self._template_swf
+        if not tpl or not os.path.exists(tpl):
+            self._bld_lbl.config(text="No template SWF loaded.", foreground='#e94560')
+            return
+        if not self._user_img:
+            self._bld_lbl.config(text="No source image loaded.", foreground='#e94560')
+            return
+        out = self._out_var.get().strip()
+        if not out:
+            self._bld_lbl.config(text="No output path set.", foreground='#e94560')
+            return
+
+        self._bld_lbl.config(text="Building…", foreground='#aaa')
+        self.update_idletasks()
+
+        sc  = self._usr_scale.get() / 100.0
+        ux  = self._usr_x.get()
+        uy  = self._usr_y.get()
+        bw  = self._template_bw
+        bh  = self._template_bh
+        cid = self._template_cid
+        user_img = self._user_img
+        tmp_dir  = self._tmp
+
+        def worker():
+            try:
+                uw  = max(1, int(user_img.width  * sc))
+                uh  = max(1, int(user_img.height * sc))
+                scaled = user_img.resize((uw, uh), Image.LANCZOS)
+
+                if bw and bh:
+                    composite = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+                    composite.paste(scaled, (ux, uy), scaled)
+                else:
+                    composite = scaled
+
+                os.makedirs(OUTPUT_DIR, exist_ok=True)
+                tmp_png = os.path.join(tmp_dir, 'partbld_out.png')
+                composite.save(tmp_png, 'PNG')
+
+                ok = replace_all_images_in_swf(tpl, {cid: tmp_png}, out)
+                if ok and not swf_has_paint_clip(tpl):
+                    ensure_paint_clip_in_swf(out, out)
+
+                if ok:
+                    kb  = os.path.getsize(out) // 1024
+                    msg = f"Built: {os.path.basename(out)}  ({kb} KB)"
+                    self.after(0, lambda: self._bld_lbl.config(
+                        text=msg, foreground='#00ff88'))
+                else:
+                    self.after(0, lambda: self._bld_lbl.config(
+                        text="Build failed — FFDec error (check ffdec path)",
+                        foreground='#e94560'))
+            except Exception as e:
+                self.after(0, lambda: self._bld_lbl.config(
+                    text=str(e), foreground='#e94560'))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+# ── GitHub Publish Dialog ──────────────────────────────────────────────────────
+
+class _GitHubPublishDialog(tk.Toplevel):
+    """Pre-flight checklist for Publish to GitHub.
+
+    Scans game cache vs local repo clone, shows NEW / CHANGED / SAME status per
+    file, lets the user tick/untick, then runs git copy+add+commit+push.
+    """
+
+    _STATUS_COLOR = {'NEW': '#00c87a', 'CHANGED': '#f59e0b', 'SAME': '#3a3a5c'}
+    _STATUS_LABEL = {'NEW': '   NEW   ', 'CHANGED': ' CHANGED ', 'SAME': '  SAME   '}
+
+    def __init__(self, parent, repo: str, game_cache: str):
+        super().__init__(parent)
+        self.title("Publish to GitHub")
+        self.geometry("800x560")
+        self.minsize(640, 400)
+        self.configure(bg=BG)
+        self.transient(parent)
+        self.grab_set()
+
+        self._repo       = repo
+        self._repo_cache = os.path.join(repo, 'cache')
+        self._game_cache = game_cache
+        self._items: list[dict] = []   # {rel, status}
+        self._vars:  dict[str, tk.BooleanVar] = {}
+        self._show_same = tk.BooleanVar(value=False)
+        self._scanning  = True
+
+        self._build_ui()
+        self._center(parent)
+        threading.Thread(target=self._scan, daemon=True).start()
+
+    # ── layout ────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # header row
+        hdr = ttk.Frame(self)
+        hdr.pack(fill='x', padx=12, pady=(10, 2))
+        self._lbl_status = ttk.Label(hdr, text="Scanning cache…",
+                                      font=('Segoe UI', 9, 'bold'))
+        self._lbl_status.pack(side='left')
+        self._pb = ttk.Progressbar(hdr, mode='indeterminate', length=110)
+        self._pb.pack(side='right')
+        self._pb.start(12)
+
+        # control bar
+        bar = ttk.Frame(self)
+        bar.pack(fill='x', padx=12, pady=(4, 4))
+        ttk.Label(bar, text="Filter:").pack(side='left')
+        self._filter_var = tk.StringVar()
+        self._filter_var.trace_add('write', lambda *_: self._rebuild_list())
+        ttk.Entry(bar, textvariable=self._filter_var, width=24).pack(side='left', padx=(4, 10))
+        ttk.Checkbutton(bar, text="Show identical files",
+                        variable=self._show_same,
+                        command=self._rebuild_list).pack(side='left', padx=(0, 10))
+        ttk.Button(bar, text="Select New + Changed",
+                   command=self._select_changed).pack(side='left', padx=(0, 4))
+        ttk.Button(bar, text="Deselect All",
+                   command=self._deselect_all).pack(side='left')
+
+        # scrollable file list
+        outer = ttk.Frame(self, relief='sunken', borderwidth=1)
+        outer.pack(fill='both', expand=True, padx=12, pady=(2, 4))
+        self._canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient='vertical', command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y')
+        self._canvas.pack(side='left', fill='both', expand=True)
+        self._inner = ttk.Frame(self._canvas)
+        self._win_id = self._canvas.create_window((0, 0), window=self._inner, anchor='nw')
+        self._inner.bind('<Configure>',
+                         lambda e: self._canvas.configure(scrollregion=self._canvas.bbox('all')))
+        self._canvas.bind('<Configure>',
+                          lambda e: self._canvas.itemconfig(self._win_id, width=e.width))
+        self._canvas.bind('<MouseWheel>',
+                          lambda e: self._canvas.yview_scroll(-1 * (e.delta // 120), 'units'))
+
+        # bottom bar
+        bot = ttk.Frame(self)
+        bot.pack(fill='x', padx=12, pady=(0, 10))
+        self._lbl_sel = ttk.Label(bot, text="", foreground='#aaa', font=('Segoe UI', 8))
+        self._lbl_sel.pack(side='left')
+        ttk.Button(bot, text="Cancel", command=self.destroy).pack(side='right', padx=(6, 0))
+        self._btn_pub = ttk.Button(bot, text="Publish 0 files",
+                                    style='Accent.TButton',
+                                    command=self._do_publish,
+                                    state='disabled')
+        self._btn_pub.pack(side='right')
+
+    def _center(self, parent):
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_x(), parent.winfo_y()
+        w, h   = self.winfo_width(), self.winfo_height()
+        self.geometry(f"+{px + (pw - w) // 2}+{py + (ph - h) // 2}")
+
+    # ── scanning ──────────────────────────────────────────────────────────────
+
+    def _scan(self):
+        items = []
+        try:
+            if not os.path.isdir(self._game_cache):
+                self.after(0, lambda: self._lbl_status.config(
+                    text='Game cache folder not found.', foreground='#e94560'))
+                return
+
+            for root, dirs, files in os.walk(self._game_cache):
+                dirs.sort()
+                for fname in sorted(files):
+                    src  = os.path.join(root, fname)
+                    rel  = os.path.relpath(src, self._game_cache).replace('\\', '/')
+                    dest = os.path.join(self._repo_cache, rel.replace('/', os.sep))
+
+                    if not os.path.exists(dest):
+                        status = 'NEW'
+                    elif os.path.getmtime(src) <= os.path.getmtime(dest):
+                        # mtime shortcut — almost certainly unchanged
+                        status = 'SAME'
+                    else:
+                        # mtime says newer — do byte compare to be sure
+                        try:
+                            same = (open(src, 'rb').read() == open(dest, 'rb').read())
+                        except Exception:
+                            same = False
+                        status = 'SAME' if same else 'CHANGED'
+
+                    items.append({'rel': rel, 'status': status})
+
+        except Exception as e:
+            self.after(0, lambda: self._lbl_status.config(
+                text=f'Scan error: {e}', foreground='#e94560'))
+            return
+
+        self.after(0, lambda: self._scan_done(items))
+
+    def _scan_done(self, items):
+        self._scanning = False
+        self._items = items
+        self._vars  = {it['rel']: tk.BooleanVar(value=(it['status'] != 'SAME'))
+                       for it in items}
+
+        self._pb.stop()
+        self._pb.pack_forget()
+
+        n_new  = sum(1 for it in items if it['status'] == 'NEW')
+        n_chg  = sum(1 for it in items if it['status'] == 'CHANGED')
+        n_same = sum(1 for it in items if it['status'] == 'SAME')
+        self._lbl_status.config(
+            text=f"{len(items)} files — {n_new} new, {n_chg} changed, {n_same} identical")
+
+        self._rebuild_list()
+
+    # ── list rendering ────────────────────────────────────────────────────────
+
+    def _rebuild_list(self):
+        for w in self._inner.winfo_children():
+            w.destroy()
+
+        filt      = self._filter_var.get().lower()
+        show_same = self._show_same.get()
+
+        visible = [it for it in self._items
+                   if (show_same or it['status'] != 'SAME')
+                   and (not filt or filt in it['rel'].lower())]
+
+        if not visible:
+            msg = ("No new or changed files." if not filt
+                   else "No files match the filter.")
+            ttk.Label(self._inner, text=msg, foreground='#666').pack(pady=20)
+        else:
+            for it in visible:
+                rel, status = it['rel'], it['status']
+                row = ttk.Frame(self._inner)
+                row.pack(fill='x', padx=4, pady=1)
+
+                ttk.Checkbutton(row, variable=self._vars[rel],
+                                command=self._update_btn).pack(side='left')
+
+                badge = tk.Label(row, text=self._STATUS_LABEL[status],
+                                 fg='white', bg=self._STATUS_COLOR[status],
+                                 font=('Segoe UI', 7, 'bold'), padx=3, pady=1)
+                badge.pack(side='left', padx=(2, 6))
+
+                note  = '  · already identical on GitHub' if status == 'SAME' else ''
+                color = FG if status != 'SAME' else '#555'
+                ttk.Label(row, text=rel + note, foreground=color,
+                          font=('Segoe UI', 8)).pack(side='left')
+
+        self._update_btn()
+
+    # ── selection helpers ─────────────────────────────────────────────────────
+
+    def _select_changed(self):
+        for it in self._items:
+            self._vars[it['rel']].set(it['status'] != 'SAME')
+        self._update_btn()
+
+    def _deselect_all(self):
+        for v in self._vars.values():
+            v.set(False)
+        self._update_btn()
+
+    def _update_btn(self):
+        sel = [rel for rel, v in self._vars.items() if v.get()]
+        n   = len(sel)
+        self._btn_pub.config(
+            text=f"Publish {n} file(s)" if n else "Publish 0 files",
+            state='normal' if n else 'disabled')
+
+        n_same = sum(1 for rel in sel
+                     if next((it for it in self._items if it['rel'] == rel),
+                              {}).get('status') == 'SAME')
+        note = f"{n} selected"
+        if n_same:
+            note += f"  ({n_same} identical — will push anyway)"
+        self._lbl_sel.config(text=note if n else "")
+
+    # ── publish ───────────────────────────────────────────────────────────────
+
+    def _do_publish(self):
+        selected = [it for it in self._items if self._vars[it['rel']].get()]
+        if not selected:
+            return
+
+        self._btn_pub.config(state='disabled', text='Publishing…')
+
+        def worker():
+            try:
+                import subprocess
+                synced = []
+                for it in selected:
+                    rel  = it['rel']
+                    src  = os.path.join(self._game_cache, rel.replace('/', os.sep))
+                    dest = os.path.join(self._repo_cache, rel.replace('/', os.sep))
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.copy2(src, dest)
+                    synced.append(rel)
+
+                subprocess.run(['git', '-C', self._repo, 'add', 'cache/'], check=True)
+                msg = f'update: {len(synced)} cache file(s)'
+                subprocess.run(['git', '-C', self._repo, 'commit', '-m', msg], check=True)
+                result = subprocess.run(['git', '-C', self._repo, 'push'],
+                                        capture_output=True, text=True)
+                if result.returncode == 0:
+                    self.after(0, lambda: self._finish(len(synced), synced))
+                else:
+                    err = result.stderr.strip()
+                    self.after(0, lambda: self._push_error(f'git push failed:\n\n{err}'))
+            except Exception as e:
+                self.after(0, lambda: self._push_error(str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish(self, count, synced):
+        self.destroy()
+        messagebox.showinfo(
+            'Published',
+            f'{count} file(s) pushed to GitHub.\n\n'
+            + '\n'.join(synced[:15])
+            + ('\n…' if count > 15 else ''))
+
+    def _push_error(self, msg):
+        self._btn_pub.config(state='normal', text='Retry publish')
+        messagebox.showerror('Push failed', msg, parent=self)
+
+
 # ── Main application ───────────────────────────────────────────────────────────
 
 class CarModderApp(tk.Tk):
@@ -3645,9 +4580,7 @@ class CarModderApp(tk.Tk):
         self._locate_ffdec()
 
     def _publish_to_github(self):
-        """Sync modified cache files to the local GitHub repo clone and push."""
-        import subprocess, shutil
-
+        """Open the Publish to GitHub pre-flight dialog."""
         repo = self._cfg.get('cache_github_repo', '').strip()
         if not repo or not os.path.isdir(os.path.join(repo, '.git')):
             repo = filedialog.askdirectory(
@@ -3660,57 +4593,7 @@ class CarModderApp(tk.Tk):
             self._cfg['cache_github_repo'] = repo
             _save_config(self._cfg)
 
-        repo_cache = os.path.join(repo, 'cache')
-        game_cache = CACHE_DIR  # live game cache
-
-        # Mirror entire game cache → repo cache, then commit changed files only
-        def _worker():
-            try:
-                # Find files modified in game cache more recently than repo counterpart
-                synced = []
-                for root, dirs, files in os.walk(game_cache):
-                    dirs.sort()
-                    for fname in sorted(files):
-                        src  = os.path.join(root, fname)
-                        rel  = os.path.relpath(src, game_cache)
-                        dest = os.path.join(repo_cache, rel)
-                        if (not os.path.exists(dest) or
-                                os.path.getmtime(src) > os.path.getmtime(dest)):
-                            os.makedirs(os.path.dirname(dest), exist_ok=True)
-                            shutil.copy2(src, dest)
-                            synced.append(rel)
-
-                if not synced:
-                    self.after(0, lambda: messagebox.showinfo(
-                        'Nothing to publish', 'No cache files have changed since last publish.',
-                        parent=self))
-                    return
-
-                # git add + commit + push
-                subprocess.run(['git', '-C', repo, 'add', 'cache/'], check=True)
-                msg = f'update: {len(synced)} cache file(s)'
-                subprocess.run(['git', '-C', repo, 'commit', '-m', msg], check=True)
-                result = subprocess.run(['git', '-C', repo, 'push'],
-                                        capture_output=True, text=True)
-                if result.returncode == 0:
-                    self.after(0, lambda: messagebox.showinfo(
-                        'Published',
-                        f'{len(synced)} file(s) pushed to GitHub.\n\n'
-                        + '\n'.join(synced[:10])
-                        + ('\n…' if len(synced) > 10 else ''),
-                        parent=self))
-                else:
-                    err = result.stderr.strip()
-                    self.after(0, lambda: messagebox.showerror(
-                        'Push failed', f'git push failed:\n\n{err}', parent=self))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror(
-                    'Error', str(e), parent=self))
-
-        threading.Thread(target=_worker, daemon=True).start()
-        messagebox.showinfo('Publishing…',
-            'Syncing cache and pushing to GitHub in the background.\n'
-            'You will be notified when complete.', parent=self)
+        _GitHubPublishDialog(self, repo, CACHE_DIR)
 
     def _locate_ffdec(self):
         path = filedialog.askopenfilename(
@@ -3797,6 +4680,15 @@ class CarModderApp(tk.Tk):
         badge_tab.rowconfigure(0, weight=1)
         self._badge_editor = BadgeEditorFrame(badge_tab, self._tmp)
         self._badge_editor.grid(row=0, column=0, sticky="nsew")
+
+        part_tab = ttk.Frame(nb, padding=4)
+        nb.add(part_tab, text="  Part Builder  ")
+        part_tab.columnconfigure(0, weight=1)
+        part_tab.rowconfigure(0, weight=1)
+        self._part_builder = PartBuilderFrame(
+            part_tab, self._tmp,
+            get_slots=lambda: list(self._slots))
+        self._part_builder.grid(row=0, column=0, sticky="nsew")
 
         # Path info strip
         info = ttk.Frame(self)
@@ -4314,6 +5206,8 @@ class CarModderApp(tk.Tk):
     # ── Slot selection / display ───────────────────────────────────────────────
 
     def _on_select(self, *_):
+        if getattr(self, '_lb_updating', False):
+            return
         sel = self._lb.curselection()
         if sel and self._slots:
             self._load_slot(self._slots[sel[0]])
@@ -4384,11 +5278,13 @@ class CarModderApp(tk.Tk):
                 foreground=FG)
             try:
                 idx = self._slots.index(slot)
+                self._lb_updating = True
                 self._lb.delete(idx)
                 self._lb.insert(idx, slot.label + ("  ★" if slot.is_modified else ""))
                 self._lb.selection_set(idx)
+                self._lb_updating = False
             except ValueError:
-                pass
+                self._lb_updating = False
 
         self.after(0, _update)
 
@@ -4724,8 +5620,16 @@ class CarModderApp(tk.Tk):
                     replacements[slot.char_id] = tmp
 
                 ok = replace_all_images_in_swf(swf_path, replacements, out_swf)
-                if ok: generated.append(out_swf)
-                else:  errors.append(fname); log(f"✗ Failed: {fname}")
+                if ok:
+                    generated.append(out_swf)
+                    # Fix paint system: if the source SWF lacks a 'paint' clip
+                    # (common in mod cars like 1002), rename 'noPaint' → 'paint' so
+                    # CarConstruction.initPart can colorize the part in the paint shop.
+                    if not swf_has_paint_clip(swf_path):
+                        if ensure_paint_clip_in_swf(out_swf, out_swf):
+                            log(f"  ↳ Added paint clip to {fname}")
+                else:
+                    errors.append(fname); log(f"✗ Failed: {fname}")
 
             # Copy non-visual files (tires, plate etc.) and patch changed values
             info = self._pkg_info.get(car_id, {})

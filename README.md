@@ -9,6 +9,27 @@ Car modding tools for Nitto Legends (open1320 / nittolol clients).
 
 ## Changelog
 
+### v0.3.5
+- **Fix rim builder — FF view outputs original rim**: two root causes: (1) `_build_worker` was reading tkinter `Scale` variables (`_tint_str`, `_bri`) from a non-main thread — Tcl is not thread-safe so the first view in the loop (always FF) could silently read stale 0 values instead of the user-set strength/brightness, producing an untinted output while FR/BF/BR got the correct values. Fixed by snapshotting all tkinter variables on the main thread before spawning the worker. (2) After a build, `_RIM_MEM` was storing the post-tint (tinted) image, so reloading the same slot would use the already-tinted image as the base for the NEXT build, compounding tints. Fixed by storing the pre-tint base image in the cache instead.
+- **Fix rim builder — wrong char_id selected when SWF has multiple bitmaps**: used `list(imgs.keys())[0]` (arbitrary dict order) instead of the char_id of the largest bitmap, which could replace a mask/secondary bitmap and leave the main rim unchanged. Now mirrors `export_image`'s `max(..., key=getsize)` logic.
+
+### v0.3.4
+- **Fix Part Builder — image not appearing**: browsing an image now always triggers a canvas render, even when no template SWF is loaded yet
+- **Fix Part Builder — user image alpha**: replaced `paste(img, mask=img)` with `alpha_composite` so semi-transparent pixels composite correctly without double-applying the alpha channel
+- **Fix decal layer resetting mid-drag**: moving a decal slider was triggering a full slot reload (which reset the decal listbox selection and slider positions) because the "modified ★" label update briefly cleared the parts listbox selection and fired `<<ListboxSelect>>`. A guard flag now blocks that spurious reload during the label update.
+
+### v0.3.3
+- **Part Builder tab** — new dedicated tab for building custom car parts from existing templates. Pick any part type (hood, bumper, body, roof, etc.) and any car in the cache as a reference. Two canvas views:
+  - **Align view** — template image shown semi-transparent; drag your custom image over it to position, Scale %, X/Y offset spinboxes, arrow key nudge, scroll to zoom, auto-fit/center helpers
+  - **Car preview** — renders the full currently-loaded car composite with your custom part swapped in, so you can see exactly how it sits on the car before building
+- Build replaces the exact bitmap character in the template SWF (same stage size, same paint clips preserved) — no more guessing dimensions.
+
+### v0.3.2
+- **Publish to GitHub — pre-flight checklist** — clicking "Publish to GitHub" now opens a dialog that scans the cache and shows every file with a NEW / CHANGED / SAME badge. New and changed files are pre-ticked; identical files are hidden by default (toggle "Show identical files" to reveal them with a note). Tick/untick any files before publishing. A filter box lets you search by path. Only the selected files are copied + committed + pushed.
+
+### v0.3.1
+- **Fix in-game paint shop** — mod cars (e.g. sourced from car 1002) have their car body SWF placed as `noPaint` instead of `paint`, causing `CarConstruction.initPart` to leave the Color object unset so `setPartColor` does nothing. The builder now detects this and renames the clip to `paint` in any output SWF that lacks one, making the paint shop work correctly for those cars.
+
 ### v0.3.0
 - **Fix plate alignment** — the game positions the plate using `bumperRear.actual.p1._x` (PlaceObject2 matrix data inside `bumperRear.swf`), not via the standalone `p1-p4.swf` files. The aligner now reads/writes the correct source: `parse_plate_bumper_swf` / `patch_plate_bumper_swf` decode and patch the bit-packed SWF matrix in-place. Default corner values updated to match actual game positions.
 - The standalone `p1-p4.swf` files are still copied unchanged (game still expects them present)
