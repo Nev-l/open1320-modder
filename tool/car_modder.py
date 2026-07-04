@@ -29,7 +29,7 @@ from swf_utils import (get_package_info, list_visual_swfs, export_image,
                         set_ffdec_path, find_ffdec_default, build_part_swf,
                         parse_tire_swf, patch_tire_swf, swf_rect_origin,
                         read_swf_info)
-from color_utils import apply_color_adjustments
+from color_utils import apply_color_adjustments, apply_rim_tint
 
 CONFIG_FILE = os.path.join(BASE_DIR, "1320modder_config.json")
 
@@ -2187,9 +2187,9 @@ class RimEditorFrame(ttk.Frame):
         self._new_id   = tk.IntVar(value=200)
         self._previews: dict[str, Image.Image | None] = {v: None for v, _ in self.VIEWS}
         self._custom:   dict[str, str | None]         = {v: None for v, _ in self.VIEWS}
-        self._hue = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
-        self._sat = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
-        self._bri = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
+        self._tint_color = {v: '#ffffff' for v, _ in self.VIEWS}
+        self._tint_str   = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
+        self._bri        = {v: tk.DoubleVar(value=0)   for v, _ in self.VIEWS}
         self._tk_imgs: list = []
         self._build_ui()
 
@@ -2236,23 +2236,37 @@ class RimEditorFrame(ttk.Frame):
             lf.columnconfigure(0, weight=1)
 
             # Preview canvas
-            cv = tk.Canvas(lf, bg=DARK, width=160, height=160, highlightthickness=0)
-            cv.grid(row=0, column=0, pady=(0, 6))
+            cv = tk.Canvas(lf, bg='#787878', width=160, height=160, highlightthickness=0)
+            cv.grid(row=0, column=0, columnspan=2, pady=(0, 6))
 
-            # Colour sliders
-            def _slider(parent, var, label, row):
-                ttk.Label(parent, text=label, foreground='#888',
-                          font=('Segoe UI', 7)).grid(row=row, column=0, sticky='w')
-                sl = tk.Scale(parent, variable=var, from_=-180, to=180,
-                              orient='horizontal', length=150, bg=BG, fg=FG,
-                              troughcolor=DARK, showvalue=1, font=('Segoe UI', 7),
-                              activebackground=ACC, highlightthickness=0,
-                              command=lambda *_: self._refresh_preview(view))
-                sl.grid(row=row, column=1, padx=(4, 0))
+            # Tint color row
+            tint_row = ttk.Frame(lf)
+            tint_row.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(0, 2))
+            ttk.Label(tint_row, text='Tint:', foreground='#888',
+                      font=('Segoe UI', 7)).pack(side='left')
+            swatch = tk.Label(tint_row, bg='#ffffff', width=3, relief='raised', cursor='hand2')
+            swatch.pack(side='left', padx=(4, 0))
+            swatch.bind('<Button-1>', lambda e, v=view: self._pick_color(v))
 
-            _slider(lf, self._hue[view], 'Hue',  1)
-            _slider(lf, self._sat[view], 'Sat',  2)
-            _slider(lf, self._bri[view], 'Bri',  3)
+            # Tint strength slider
+            ttk.Label(lf, text='Strength', foreground='#888',
+                      font=('Segoe UI', 7)).grid(row=2, column=0, sticky='w')
+            tk.Scale(lf, variable=self._tint_str[view], from_=0, to=100,
+                     orient='horizontal', length=150, bg=BG, fg=FG,
+                     troughcolor=DARK, showvalue=1, font=('Segoe UI', 7),
+                     activebackground=ACC, highlightthickness=0,
+                     command=lambda *_, v=view: self._refresh_preview(v)
+                     ).grid(row=2, column=1, padx=(4, 0))
+
+            # Brightness slider
+            ttk.Label(lf, text='Brightness', foreground='#888',
+                      font=('Segoe UI', 7)).grid(row=3, column=0, sticky='w')
+            tk.Scale(lf, variable=self._bri[view], from_=-100, to=100,
+                     orient='horizontal', length=150, bg=BG, fg=FG,
+                     troughcolor=DARK, showvalue=1, font=('Segoe UI', 7),
+                     activebackground=ACC, highlightthickness=0,
+                     command=lambda *_, v=view: self._refresh_preview(v)
+                     ).grid(row=3, column=1, padx=(4, 0))
 
             # Buttons
             btn_fr = ttk.Frame(lf)
@@ -2263,7 +2277,7 @@ class RimEditorFrame(ttk.Frame):
             ttk.Button(btn_fr, text='Reset',
                        command=lambda v=view: self._reset_view(v)).pack(side='left')
 
-            self._view_panels[view] = {'cv': cv, 'lf': lf}
+            self._view_panels[view] = {'cv': cv, 'lf': lf, 'swatch': swatch}
 
     # ── Actions ────────────────────────────────────────────────────────────────
 
@@ -2310,18 +2324,27 @@ class RimEditorFrame(ttk.Frame):
 
         self.after(0, _finish)
 
+    def _pick_color(self, view: str):
+        from tkinter.colorchooser import askcolor
+        initial = self._tint_color.get(view, '#ffffff')
+        result = askcolor(color=initial, title=f'Rim tint color — {view}')
+        if result and result[1]:
+            self._tint_color[view] = result[1]
+            self._view_panels[view]['swatch'].config(bg=result[1])
+            self._refresh_preview(view)
+
     def _refresh_preview(self, view: str):
         src = self._previews.get(view)
         if src is None:
             return
         custom_path = self._custom.get(view)
         raw = Image.open(custom_path).convert('RGBA') if custom_path else src.copy()
-        raw = apply_color_adjustments(raw,
-                                      self._hue[view].get(),
-                                      self._sat[view].get(),
-                                      self._bri[view].get())
+        raw = apply_rim_tint(raw,
+                             color_hex=self._tint_color.get(view, '#ffffff'),
+                             strength=self._tint_str[view].get() / 100.0,
+                             brightness_delta=self._bri[view].get() / 100.0)
         # Composite over neutral grey so transparent areas are visible
-        bg  = Image.new('RGBA', raw.size, self._PREVIEW_BG)
+        bg = Image.new('RGBA', raw.size, self._PREVIEW_BG)
         bg.paste(raw, mask=raw)
         # Fit into 160×160 keeping aspect ratio, pad remainder with bg colour
         raw_w, raw_h = bg.size
@@ -2352,10 +2375,11 @@ class RimEditorFrame(ttk.Frame):
         self._refresh_preview(view)
 
     def _reset_view(self, view: str):
-        self._custom[view] = None
-        self._hue[view].set(0)
-        self._sat[view].set(0)
+        self._custom[view]       = None
+        self._tint_color[view]   = '#ffffff'
+        self._tint_str[view].set(0)
         self._bri[view].set(0)
+        self._view_panels[view]['swatch'].config(bg='#ffffff')
         self._refresh_preview(view)
 
     def _build_rim(self):
@@ -2388,10 +2412,10 @@ class RimEditorFrame(ttk.Frame):
             else:
                 errors.append(f'{view}:no-preview')
                 continue
-            final = apply_color_adjustments(final,
-                                            self._hue[view].get(),
-                                            self._sat[view].get(),
-                                            self._bri[view].get())
+            final = apply_rim_tint(final,
+                                   color_hex=self._tint_color.get(view, '#ffffff'),
+                                   strength=self._tint_str[view].get() / 100.0,
+                                   brightness_delta=self._bri[view].get() / 100.0)
             tmp_img = os.path.join(self._tmp, f"rim_bld_{new_id}_{view}.png")
             final.save(tmp_img, 'PNG')
             out_swf = os.path.join(self.WHEEL_DIR, f"wheel{view}_{new_id}.swf")
@@ -2534,6 +2558,8 @@ class BadgeEditorFrame(ttk.Frame):
 
     # ── Grid ───────────────────────────────────────────────────────────────────
 
+    _BATCH = 60  # thumbnails per event-loop tick
+
     def _draw_grid(self):
         if not self._badges:
             return
@@ -2546,53 +2572,67 @@ class BadgeEditorFrame(ttk.Frame):
         self._cv.delete("all")
         self._thumbs.clear()
 
+        # Draw placeholder boxes instantly so the grid appears immediately
         for idx, bid in enumerate(self._ids):
             col = idx % cols
             row = idx // cols
             x   = P + col * step
             y   = P + row * step
             bd  = self._badges[bid]
-
             tag = f"b{bid}"
+            fill = "#0f3460" if bd.is_new else "#222"
+            self._cv.create_rectangle(x, y, x + T, y + T, fill=fill, outline="", tags=tag)
             if bd.is_new:
-                # New badges: blue placeholder box with "NEW" label
-                src = bd.new_small
-                try:
-                    img    = Image.open(src).convert("RGBA").resize((T, T), Image.LANCZOS)
-                    tk_img = ImageTk.PhotoImage(img)
-                    self._thumbs.append(tk_img)
-                    self._cv.create_image(x, y, anchor="nw", image=tk_img, tags=tag)
-                except Exception:
-                    self._thumbs.append(None)
-                    self._cv.create_rectangle(x, y, x + T, y + T,
-                                               fill="#0f3460", outline="#00aaff", tags=tag)
-                    self._cv.create_text(x + T // 2, y + T // 2, text="NEW",
-                                          font=("Consolas", 7, "bold"), fill="#00aaff", tags=tag)
-                # Blue corner = new
-                self._cv.create_rectangle(x, y, x + 8, y + 8,
-                                           fill="#00aaff", outline="", tags=tag)
-            else:
-                src = bd.custom_path or bd.small_path
-                try:
-                    img    = Image.open(src).convert("RGBA").resize((T, T), Image.LANCZOS)
-                    tk_img = ImageTk.PhotoImage(img)
-                    self._thumbs.append(tk_img)
-                    self._cv.create_image(x, y, anchor="nw", image=tk_img, tags=tag)
-                except Exception:
-                    self._thumbs.append(None)
-                    self._cv.create_rectangle(x, y, x + T, y + T, fill="#333", tags=tag)
-                # Green corner = replaced
-                if bd.custom_path:
-                    self._cv.create_rectangle(x + T - 6, y, x + T, y + 6,
-                                               fill="#00ff88", outline="", tags=tag)
-
-            # Selection highlight
+                self._cv.create_text(x + T // 2, y + T // 2, text="NEW",
+                                      font=("Consolas", 7, "bold"), fill="#00aaff", tags=tag)
             if bid == self._sel_id:
                 self._cv.create_rectangle(x - 1, y - 1, x + T + 1, y + T + 1,
                                            outline=ACC, width=2, tags=tag)
 
         rows = (len(self._ids) + cols - 1) // cols
         self._cv.configure(scrollregion=(0, 0, cols * step + P, rows * step + P))
+
+        # Lazy-load thumbnails in batches so UI stays responsive
+        self._thumbs = [None] * len(self._ids)
+        self._load_batch(0, cols)
+
+    def _load_batch(self, start: int, cols: int):
+        T, P = self.THUMB, self.PAD
+        step  = T + P
+        end = min(start + self._BATCH, len(self._ids))
+        for idx in range(start, end):
+            bid = self._ids[idx]
+            bd  = self._badges[bid]
+            col = idx % cols
+            row = idx // cols
+            x   = P + col * step
+            y   = P + row * step
+            tag = f"b{bid}"
+            if bd.is_new:
+                src = bd.new_small
+                corner_fill = "#00aaff"
+            else:
+                src = bd.custom_path or bd.small_path
+                corner_fill = None
+            try:
+                img    = Image.open(src).convert("RGBA").resize((T, T), Image.LANCZOS)
+                tk_img = ImageTk.PhotoImage(img)
+                self._thumbs[idx] = tk_img
+                self._cv.delete(tag)
+                self._cv.create_image(x, y, anchor="nw", image=tk_img, tags=tag)
+                if bd.is_new:
+                    self._cv.create_rectangle(x, y, x + 8, y + 8,
+                                               fill="#00aaff", outline="", tags=tag)
+                elif bd.custom_path:
+                    self._cv.create_rectangle(x + T - 6, y, x + T, y + 6,
+                                               fill="#00ff88", outline="", tags=tag)
+            except Exception:
+                pass
+            if bid == self._sel_id:
+                self._cv.create_rectangle(x - 1, y - 1, x + T + 1, y + T + 1,
+                                           outline=ACC, width=2, tags=tag)
+        if end < len(self._ids):
+            self.after(1, self._load_batch, end, cols)
 
     def _on_click(self, event):
         T, P = self.THUMB, self.PAD

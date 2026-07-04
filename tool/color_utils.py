@@ -95,3 +95,45 @@ def apply_color_adjustments(
     if brightness != 1.0:
         img = adjust_brightness(img, brightness)
     return img
+
+
+def apply_rim_tint(
+    image: Image.Image,
+    color_hex: str = '#ffffff',
+    strength: float = 0.0,
+    brightness_delta: float = 0.0,
+) -> Image.Image:
+    """Tint a (mostly greyscale) rim image using multiply-blend.
+
+    strength 0.0 = original colours, 1.0 = fully tinted.
+    brightness_delta: -1.0 to +1.0 additive shift on pixel luminance.
+    """
+    img = image.convert('RGBA')
+
+    # Parse hex color
+    color_hex = color_hex.lstrip('#')
+    if len(color_hex) == 3:
+        color_hex = ''.join(c * 2 for c in color_hex)
+    cr = int(color_hex[0:2], 16) / 255.0
+    cg = int(color_hex[2:4], 16) / 255.0
+    cb = int(color_hex[4:6], 16) / 255.0
+
+    arr = np.array(img, dtype=np.float32)
+    rgb = arr[..., :3] / 255.0
+    alpha = arr[..., 3:4]
+
+    # Brightness adjustment (additive on all channels)
+    if brightness_delta != 0.0:
+        rgb = np.clip(rgb + brightness_delta, 0.0, 1.0)
+
+    if strength > 0.0:
+        # Luminance of each pixel
+        lum = rgb.mean(axis=-1, keepdims=True)
+        # Multiply-tinted version: preserve shadow/highlight structure
+        tinted = np.stack([lum[..., 0] * cr,
+                           lum[..., 0] * cg,
+                           lum[..., 0] * cb], axis=-1)
+        rgb = rgb * (1.0 - strength) + tinted * strength
+
+    out = np.concatenate([np.clip(rgb * 255, 0, 255), alpha], axis=-1).astype(np.uint8)
+    return Image.fromarray(out, 'RGBA')
