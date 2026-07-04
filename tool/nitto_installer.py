@@ -30,12 +30,14 @@ GAME_DIR     = os.path.normpath(os.path.join(BASE_DIR, ".."))
 CACHE_DIR    = os.path.join(GAME_DIR, "cache")
 CAR_DIR      = os.path.join(CACHE_DIR, "car")
 PACKAGES_DIR = os.path.join(CAR_DIR,  "packages")
+WHEEL_DIR    = os.path.join(CAR_DIR,  "wheel")
 
 # ── Server ─────────────────────────────────────────────────────────────────────
 
 SERVER       = "http://nitto.lol:8184"
 MANIFEST_URL = SERVER + "/mods/manifest.json"
 MANIFEST_ALL = SERVER + "/mods/manifest-all.json"
+RIMS_MANI_URL = SERVER + "/mods/rims/manifest.json"
 
 # ── Theme ──────────────────────────────────────────────────────────────────────
 
@@ -150,13 +152,15 @@ class InstallerApp(tk.Tk):
         self.resizable(True, True)
         self.minsize(900, 580)
 
-        self._manifest   = None
-        self._cars       = []
-        self._chk_vars   = {}
-        self._prev_tk    = None
-        self._installing = False
-        self._admin_mode = False
-        self._admin_key  = ""        # validated key kept in memory only
+        self._manifest    = None
+        self._cars        = []
+        self._chk_vars    = {}
+        self._rims        = []
+        self._rim_chk     = {}
+        self._prev_tk     = None
+        self._installing  = False
+        self._admin_mode  = False
+        self._admin_key   = ""
 
         self._style()
         self._build_ui()
@@ -225,13 +229,17 @@ class InstallerApp(tk.Tk):
         body.columnconfigure(1, weight=0)
         body.rowconfigure(0, weight=1)
 
-        # Left: car list
-        list_lf = ttk.LabelFrame(body, text="Available Car Mods", padding=6)
-        list_lf.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        list_lf.rowconfigure(1, weight=1)
-        list_lf.columnconfigure(0, weight=1)
+        # Tabs: Cars | Rims
+        nb = ttk.Notebook(body)
+        nb.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-        sel_fr = ttk.Frame(list_lf)
+        # ── Cars tab ──────────────────────────────────────────────────────────
+        cars_tab = ttk.Frame(nb, padding=4)
+        nb.add(cars_tab, text="  Cars  ")
+        cars_tab.rowconfigure(1, weight=1)
+        cars_tab.columnconfigure(0, weight=1)
+
+        sel_fr = ttk.Frame(cars_tab)
         sel_fr.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         ttk.Button(sel_fr, text="Select All",  command=self._select_all).pack(side="left", padx=(0, 4))
         ttk.Button(sel_fr, text="Select None", command=self._select_none).pack(side="left")
@@ -239,17 +247,47 @@ class InstallerApp(tk.Tk):
         self._count_lbl.pack(side="right")
 
         cols = ("sel", "name", "author", "version", "size", "status")
-        self._tree = ttk.Treeview(list_lf, columns=cols, show="headings", selectmode="browse")
+        self._tree = ttk.Treeview(cars_tab, columns=cols, show="headings", selectmode="browse")
         for c, w, lbl in [("sel",40,""),("name",200,"Car Name"),("author",110,"Author"),
                            ("version",60,"Version"),("size",70,"Size"),("status",100,"Status")]:
             self._tree.heading(c, text=lbl)
             self._tree.column(c, width=w, minwidth=w, stretch=(c == "name"))
         self._tree.grid(row=1, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(list_lf, orient="vertical", command=self._tree.yview)
+        sb = ttk.Scrollbar(cars_tab, orient="vertical", command=self._tree.yview)
         sb.grid(row=1, column=1, sticky="ns")
         self._tree.configure(yscrollcommand=sb.set)
         self._tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self._tree.bind("<Button-1>",         self._on_tree_click)
+
+        # ── Rims tab ──────────────────────────────────────────────────────────
+        rims_tab = ttk.Frame(nb, padding=4)
+        nb.add(rims_tab, text="  Rims  ")
+        rims_tab.rowconfigure(1, weight=1)
+        rims_tab.columnconfigure(0, weight=1)
+
+        rim_sel_fr = ttk.Frame(rims_tab)
+        rim_sel_fr.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Button(rim_sel_fr, text="Select All",
+                   command=self._rim_select_all).pack(side="left", padx=(0, 4))
+        ttk.Button(rim_sel_fr, text="Select None",
+                   command=self._rim_select_none).pack(side="left")
+        self._rim_count_lbl = ttk.Label(rim_sel_fr, text="", foreground="#666",
+                                         font=("Segoe UI", 8))
+        self._rim_count_lbl.pack(side="right")
+
+        rim_cols = ("sel", "name", "author", "rim_id", "size", "status")
+        self._rim_tree = ttk.Treeview(rims_tab, columns=rim_cols, show="headings",
+                                       selectmode="browse")
+        for c, w, lbl in [("sel",40,""),("name",200,"Pack Name"),("author",110,"Author"),
+                           ("rim_id",70,"Rim Slot"),("size",70,"Size"),("status",100,"Status")]:
+            self._rim_tree.heading(c, text=lbl)
+            self._rim_tree.column(c, width=w, minwidth=w, stretch=(c == "name"))
+        self._rim_tree.grid(row=1, column=0, sticky="nsew")
+        rim_sb = ttk.Scrollbar(rims_tab, orient="vertical", command=self._rim_tree.yview)
+        rim_sb.grid(row=1, column=1, sticky="ns")
+        self._rim_tree.configure(yscrollcommand=rim_sb.set)
+        self._rim_tree.bind("<<TreeviewSelect>>", self._on_rim_select)
+        self._rim_tree.bind("<Button-1>",         self._on_rim_click)
 
         # Right panel
         right = ttk.Frame(body, width=240)
@@ -306,15 +344,17 @@ class InstallerApp(tk.Tk):
         # Bottom bar
         bot = tk.Frame(self, bg=BG, pady=8)
         bot.grid(row=2, column=0, sticky="ew")
-        bot.columnconfigure(1, weight=1)
-        ttk.Button(bot, text="Install Selected", style="Accent.TButton",
-                   command=self._install_selected).grid(row=0, column=0, padx=(12, 8))
+        bot.columnconfigure(2, weight=1)
+        ttk.Button(bot, text="Install Cars", style="Accent.TButton",
+                   command=self._install_selected).grid(row=0, column=0, padx=(12, 4))
+        ttk.Button(bot, text="Install Rims", style="Accent.TButton",
+                   command=self._install_rims_selected).grid(row=0, column=1, padx=(0, 8))
         self._prog = ttk.Progressbar(bot, mode="determinate", length=400)
-        self._prog.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self._prog.grid(row=0, column=2, sticky="ew", padx=(0, 8))
         self._status = tk.StringVar(value="Ready.")
         tk.Label(bot, textvariable=self._status, bg=BG, fg="#aaa",
                   font=("Segoe UI", 8), anchor="w").grid(
-            row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(4, 0))
+            row=1, column=0, columnspan=4, sticky="ew", padx=12, pady=(4, 0))
 
         # Log
         log_lf = ttk.LabelFrame(self, text="Log", padding=4)
@@ -379,6 +419,7 @@ class InstallerApp(tk.Tk):
         self._log_line("Fetching manifest" + (" (admin)" if self._admin_mode else ""))
         threading.Thread(target=self._fetch_worker,
                           args=(url, headers), daemon=True).start()
+        threading.Thread(target=self._fetch_rims_worker, daemon=True).start()
 
     def _fetch_worker(self, url, headers):
         try:
@@ -405,6 +446,181 @@ class InstallerApp(tk.Tk):
         self._log_line(f"ERROR: {err}")
         messagebox.showerror("Connection Error",
                               f"Could not fetch mod list:\n\n{err}", parent=self)
+
+    # ── Rims manifest ──────────────────────────────────────────────────────────
+
+    def _fetch_rims_worker(self):
+        try:
+            data     = _get(RIMS_MANI_URL)
+            manifest = json.loads(data.decode("utf-8"))
+            self.after(0, lambda: self._on_rims_manifest(manifest))
+        except Exception as e:
+            self.after(0, lambda: self._log_line(f"Rims: {e}"))
+
+    def _on_rims_manifest(self, manifest):
+        self._rims = manifest.get("rims", [])
+        self._log_line(f"Rims manifest: {len(self._rims)} pack(s).")
+        self._populate_rim_tree()
+
+    def _populate_rim_tree(self):
+        for iid in self._rim_tree.get_children():
+            self._rim_tree.delete(iid)
+        self._rim_chk.clear()
+        for pack in self._rims:
+            pid    = pack["id"]
+            status = self._rim_install_status(pack)
+            var    = tk.BooleanVar(value=False)
+            self._rim_chk[pid] = var
+            tag    = "installed" if status == "Installed" else ""
+            self._rim_tree.insert("", "end", iid=pid,
+                values=("☐", pack.get("name", pid), pack.get("author", "—"),
+                        str(pack.get("rim_id", "?")), _human_size(pack.get("total_bytes", 0)),
+                        status),
+                tags=(tag,))
+        self._rim_tree.tag_configure("installed", foreground="#00c87a")
+        self._rim_count_lbl.config(text="")
+
+    def _rim_install_status(self, pack):
+        rid   = pack.get("rim_id", 0)
+        files = pack.get("files", [])
+        if not files or not rid:
+            return "—"
+        dest = os.path.join(WHEEL_DIR, f"wheelFF_{rid}.swf")
+        return "Installed" if os.path.exists(dest) else "Not installed"
+
+    def _on_rim_click(self, evt):
+        col = self._rim_tree.identify_column(evt.x)
+        iid = self._rim_tree.identify_row(evt.y)
+        if not iid:
+            return
+        var = self._rim_chk.get(iid)
+        if var:
+            var.set(not var.get())
+            vals = list(self._rim_tree.item(iid, "values"))
+            vals[0] = "☑" if var.get() else "☐"
+            self._rim_tree.item(iid, values=vals)
+            n = sum(1 for v in self._rim_chk.values() if v.get())
+            self._rim_count_lbl.config(text=f"{n} selected")
+
+    def _on_rim_select(self, *_):
+        sel = self._rim_tree.selection()
+        if not sel:
+            return
+        pack = next((p for p in self._rims if p["id"] == sel[0]), None)
+        if pack:
+            lines = [
+                f"Name:    {pack.get('name','—')}",
+                f"Author:  {pack.get('author','—')}",
+                f"Rim slot:{pack.get('rim_id','—')}",
+                f"Files:   {len(pack.get('files',[]))}",
+                f"Version: {pack.get('version','1.0')}",
+            ]
+            desc = pack.get("description", "")
+            if desc:
+                lines += ["", desc]
+            self._info_text.configure(state="normal")
+            self._info_text.delete("1.0", "end")
+            self._info_text.insert("1.0", "\n".join(lines))
+            self._info_text.configure(state="disabled")
+
+    def _rim_select_all(self):
+        for iid in self._rim_tree.get_children():
+            v = self._rim_chk.get(iid)
+            if v:
+                v.set(True)
+                vals = list(self._rim_tree.item(iid, "values"))
+                vals[0] = "☑"
+                self._rim_tree.item(iid, values=vals)
+        n = sum(1 for v in self._rim_chk.values() if v.get())
+        self._rim_count_lbl.config(text=f"{n} selected")
+
+    def _rim_select_none(self):
+        for iid in self._rim_tree.get_children():
+            v = self._rim_chk.get(iid)
+            if v:
+                v.set(False)
+                vals = list(self._rim_tree.item(iid, "values"))
+                vals[0] = "☐"
+                self._rim_tree.item(iid, values=vals)
+        self._rim_count_lbl.config(text="0 selected")
+
+    def _install_rims_selected(self):
+        if self._installing:
+            return
+        selected = [p for p in self._rims if self._rim_chk.get(p["id"], tk.BooleanVar()).get()]
+        if not selected:
+            messagebox.showinfo("Nothing selected", "Tick at least one rim pack.", parent=self)
+            return
+        if not messagebox.askyesno("Confirm install",
+                f"Install {len(selected)} rim pack(s) into:\n{WHEEL_DIR}\n\nContinue?",
+                parent=self):
+            return
+        self._installing = True
+        threading.Thread(target=self._install_rims_worker,
+                          args=(selected,), daemon=True).start()
+
+    def _install_rims_worker(self, packs):
+        os.makedirs(WHEEL_DIR, exist_ok=True)
+        total  = sum(len(p.get("files", [])) for p in packs)
+        done   = 0
+        errors = []
+        base   = SERVER + "/mods"
+        VIEW_MAP = {"wheelFF": "FF", "wheelFR": "FR", "wheelBF": "BF", "wheelBR": "BR",
+                    "wheelR": "BF"}
+
+        for pack in packs:
+            pid   = pack["id"]
+            rid   = pack.get("rim_id", 0)
+            name  = pack.get("name", pid)
+            files = pack.get("files", [])
+            self._set_status(f"Installing {name}…")
+            self._log_line(f"\n[Rim: {name}] slot {rid}")
+
+            for fname in files:
+                # Determine which game view file this maps to
+                stem = fname.replace(".swf", "").lower()
+                dest_name = None
+                for hint, view in VIEW_MAP.items():
+                    if hint.lower() in stem:
+                        dest_name = f"wheel{view}_{rid}.swf"
+                        break
+                if dest_name is None:
+                    dest_name = fname  # keep original if no hint
+
+                url  = f"{base}/rims/{pid}/{fname}"
+                dest = os.path.join(WHEEL_DIR, dest_name)
+                try:
+                    self._log_line(f"  {fname} → {dest_name}…")
+                    data = _get(url)
+                    with open(dest, "wb") as f:
+                        f.write(data)
+                except Exception as e:
+                    self._log_line(f"  ERROR: {e}")
+                    errors.append(f"{name}/{fname}: {e}")
+                done += 1
+                self._set_prog(done, total)
+
+            # Refresh row
+            self.after(0, lambda p=pack: self._refresh_rim_row(p))
+
+        self._installing = False
+        if errors:
+            self._set_status(f"Done with {len(errors)} error(s).")
+            self.after(0, lambda: messagebox.showwarning(
+                "Install complete", f"{len(errors)} error(s):\n" + "\n".join(errors), parent=self))
+        else:
+            self._set_status(f"{len(packs)} rim pack(s) installed.")
+            self.after(0, lambda: messagebox.showinfo(
+                "Installed", f"{len(packs)} rim pack(s) installed into:\n{WHEEL_DIR}", parent=self))
+
+    def _refresh_rim_row(self, pack):
+        pid = pack["id"]
+        if self._rim_tree.exists(pid):
+            vals    = list(self._rim_tree.item(pid, "values"))
+            status  = self._rim_install_status(pack)
+            vals[5] = status
+            self._rim_tree.item(pid, values=vals,
+                                 tags=("installed",) if status == "Installed" else ())
 
     # ── Tree ───────────────────────────────────────────────────────────────────
 

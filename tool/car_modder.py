@@ -2434,6 +2434,18 @@ class RimEditorFrame(ttk.Frame):
         ttk.Button(top, text='Build & Save to Cache', style='Warn.TButton',
                    command=self._build_rim).pack(side='left', padx=(6, 0))
 
+        ttk.Separator(top, orient='vertical').pack(side='left', fill='y', padx=12)
+
+        ttk.Label(top, text='Pack Name:').pack(side='left')
+        self._pack_name = tk.StringVar(value='Custom Rim Pack')
+        ttk.Entry(top, textvariable=self._pack_name, width=16).pack(side='left', padx=(4, 0))
+        ttk.Label(top, text='Rim Slot:').pack(side='left', padx=(6, 0))
+        self._upload_rim_id = tk.IntVar(value=64)
+        ttk.Spinbox(top, textvariable=self._upload_rim_id, from_=1, to=9999,
+                    width=5).pack(side='left', padx=(4, 0))
+        ttk.Button(top, text='Upload to nitto.lol',
+                   command=self._upload_rim_pack).pack(side='left', padx=(6, 0))
+
         self._status = ttk.Label(top, text='Load a rim to start editing.',
                                   foreground='#aaa')
         self._status.pack(side='left', padx=(12, 0))
@@ -2821,6 +2833,88 @@ class RimEditorFrame(ttk.Frame):
         msg = f'Rim {new_id} built: {", ".join(built)}.' if built else f'Build failed: {", ".join(errors)}'
         col = '#00c87a' if not errors else ('#e94560' if not built else '#ffaa00')
         self.after(0, lambda: self._status.config(text=msg, foreground=col))
+
+    def _upload_rim_pack(self):
+        import urllib.request, urllib.error
+        api_key = _load_config().get('upload_api_key', 'nevlol')
+
+        pack_name = self._pack_name.get().strip() or 'Custom Rim Pack'
+        rim_id    = self._upload_rim_id.get()
+        pack_id   = f"rim_{rim_id}"
+
+        # Gather SWF files to upload — use built game wheel SWFs if present, else custom SWFs
+        VIEW_FNAME = {'FF': f'wheelFF_{rim_id}.swf', 'FR': f'wheelFR_{rim_id}.swf',
+                      'BF': f'wheelBF_{rim_id}.swf', 'BR': f'wheelBR_{rim_id}.swf'}
+        VIEW_UPLOAD = {'FF': 'wheelFF.swf', 'FR': 'wheelFR.swf',
+                       'BF': 'wheelBF.swf', 'BR': 'wheelBR.swf'}
+
+        to_upload: dict[str, str] = {}  # upload_filename → local path
+        for view, upload_name in VIEW_UPLOAD.items():
+            cached = os.path.join(self.WHEEL_DIR, VIEW_FNAME[view])
+            if os.path.exists(cached):
+                to_upload[upload_name] = cached
+
+        if not to_upload:
+            messagebox.showwarning('Nothing to upload',
+                'Build the rim first (Build & Save to Cache) or load custom SWFs.',
+                parent=self)
+            return
+
+        if not messagebox.askyesno('Upload to nitto.lol',
+                f'Upload rim pack "{pack_name}" (slot {rim_id}) with {len(to_upload)} file(s)?',
+                parent=self):
+            return
+
+        self._status.config(text='Uploading…', foreground='#aaa')
+        threading.Thread(target=self._upload_rim_worker,
+                         args=(api_key, pack_id, pack_name, rim_id, to_upload),
+                         daemon=True).start()
+
+    def _upload_rim_worker(self, api_key, pack_id, pack_name, rim_id, to_upload):
+        import urllib.request, urllib.error
+        SERVER = 'http://nitto.lol:8184'
+
+        def _post(url, data, ct='application/json'):
+            req = urllib.request.Request(url, data=data, method='POST',
+                                         headers={'X-Api-Key': api_key,
+                                                  'Content-Type': ct,
+                                                  'Content-Length': str(len(data))})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode())
+
+        try:
+            # 1. Register the pack
+            meta_resp = _post(SERVER + '/mods/upload/rim/meta',
+                              json.dumps({'pack_id': pack_id, 'name': pack_name,
+                                          'rim_id': rim_id}).encode())
+            if not meta_resp.get('ok'):
+                raise RuntimeError(meta_resp.get('error', 'meta failed'))
+
+            # 2. Upload each SWF
+            uploaded = []
+            for upload_name, local_path in to_upload.items():
+                swf_data = open(local_path, 'rb').read()
+                boundary = 'RimUploadBoundary'
+                body = (
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="pack_id"\r\n\r\n'
+                    f'{pack_id}\r\n'
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="filename"\r\n\r\n'
+                    f'{upload_name}\r\n'
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{upload_name}"\r\n'
+                    f'Content-Type: application/octet-stream\r\n\r\n'
+                ).encode() + swf_data + f'\r\n--{boundary}--\r\n'.encode()
+                r = _post(SERVER + '/mods/upload/rim/file', body,
+                          ct=f'multipart/form-data; boundary={boundary}')
+                if not r.get('ok'):
+                    raise RuntimeError(f'{upload_name}: {r.get("error","?")}')
+                uploaded.append(upload_name)
+
+            msg = f'Uploaded {len(uploaded)} file(s) as "{pack_name}" (slot {rim_id}).'
+            self.after(0, lambda: self._status.config(text=msg, foreground='#00c87a'))
+        except Exception as e:
+            err = str(e)
+            self.after(0, lambda: self._status.config(
+                text=f'Upload failed: {err}', foreground='#e94560'))
 
 
 class BadgeEditorFrame(ttk.Frame):
