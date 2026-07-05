@@ -9,6 +9,10 @@ Car modding tools for Nitto Legends (open1320 / nittolol clients).
 
 ## Changelog
 
+### v0.3.8
+- **Fix Part Builder — image not visible on canvas**: `alpha_composite` was only clipping the left/top edges of the user image when positioned near the canvas boundary. If the image extended past the right or bottom edge, Pillow raised an error and nothing rendered. Now clips all four edges before compositing. Errors during render are shown inline rather than silently swallowing the frame.
+- **Decal drag-to-position**: you can now click and drag directly on the modified preview canvas to reposition the selected decal. The X/Y sliders and spinboxes stay in sync. No more fighting with the coarse slider for fine positioning.
+
 ### v0.3.7
 - **Rim image picker** — when a wheel SWF contains more than one bitmap (e.g. a rim image plus an alpha mask), loading now auto-shows a thumbnail picker for each affected view so you can click the correct image. "Pick Image…" button on each view panel lets you re-pick at any time. The selected char_id is remembered and used when building, so the right bitmap gets replaced in the output SWF.
 

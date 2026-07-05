@@ -2,7 +2,7 @@
 1320 Legends Car Modder
 Per-part image editing, custom image upload, overlay alignment, and badge editor.
 """
-VERSION = "0.3.7"
+VERSION = "0.3.8"
 import os, sys, shutil, tempfile, threading, math, dataclasses, json, tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 from PIL import Image, ImageTk, ImageDraw
@@ -4086,24 +4086,32 @@ class PartBuilderFrame(ttk.Frame):
 
         # User image with cyan outline
         if self._user_img:
-            sc = self._usr_scale.get() / 100.0
-            uw = max(1, int(self._user_img.width  * sc * z))
-            uh = max(1, int(self._user_img.height * sc * z))
-            px = ox + int(self._usr_x.get() * z)
-            py = oy + int(self._usr_y.get() * z)
-            usr = self._user_img.resize((uw, uh), Image.LANCZOS)
-            frame = Image.new("RGBA", (uw + 2, uh + 2), (0, 0, 0, 0))
-            fd = ImageDraw.Draw(frame)
-            fd.rectangle([0, 0, uw + 1, uh + 1], outline=(0, 210, 255, 230), width=1)
-            frame.alpha_composite(usr, dest=(1, 1))
-            layer2 = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
-            dx, dy = px - 1, py - 1
-            sx, sy = max(0, -dx), max(0, -dy)
-            dx, dy = max(0, dx), max(0, dy)
-            src_crop = frame.crop((sx, sy, frame.width, frame.height))
-            if src_crop.width > 0 and src_crop.height > 0:
-                layer2.alpha_composite(src_crop, dest=(dx, dy))
-            canvas = Image.alpha_composite(canvas, layer2)
+            try:
+                sc = self._usr_scale.get() / 100.0
+                uw = max(1, int(self._user_img.width  * sc * z))
+                uh = max(1, int(self._user_img.height * sc * z))
+                px = ox + int(self._usr_x.get() * z)
+                py = oy + int(self._usr_y.get() * z)
+                usr = self._user_img.resize((uw, uh), Image.LANCZOS)
+                frame = Image.new("RGBA", (uw + 2, uh + 2), (0, 0, 0, 0))
+                fd = ImageDraw.Draw(frame)
+                fd.rectangle([0, 0, uw + 1, uh + 1], outline=(0, 210, 255, 230), width=1)
+                frame.alpha_composite(usr, dest=(1, 1))
+                layer2 = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
+                # Clip all four edges so the crop fits both frame and layer2 exactly
+                dst_x = max(0, px - 1)
+                dst_y = max(0, py - 1)
+                src_x = max(0, -(px - 1))
+                src_y = max(0, -(py - 1))
+                src_w = min(frame.width  - src_x, cw - dst_x)
+                src_h = min(frame.height - src_y, ch - dst_y)
+                if src_w > 0 and src_h > 0:
+                    src_crop = frame.crop((src_x, src_y, src_x + src_w, src_y + src_h))
+                    layer2.alpha_composite(src_crop, dest=(dst_x, dst_y))
+                canvas = Image.alpha_composite(canvas, layer2)
+            except Exception as e:
+                di2 = ImageDraw.Draw(canvas)
+                di2.text((ox + 3, oy + 20), f"render error: {e}", fill=(220, 80, 80, 255))
 
         # Info overlay
         di = ImageDraw.Draw(canvas)
@@ -4636,6 +4644,9 @@ class CarModderApp(tk.Tk):
         self._sel: ImageSlot|None = None
         self._decal_groups: dict[str, list] = {}
         self._tk_orig = self._tk_mod = None
+        self._mod_disp_scale  = 1.0
+        self._mod_drag_start  = None
+        self._mod_drag_origin = None
 
         # Wheel position vars: (view, tire) → {var_name: DoubleVar}
         # view = 'f' or 'b', tire = 'F' (front), 'R' (rear), 'Back' (far-side race wheel, b only)
@@ -4991,6 +5002,9 @@ class CarModderApp(tk.Tk):
         mod_lf.rowconfigure(0, weight=1); mod_lf.columnconfigure(0, weight=1)
         self._c_mod = tk.Canvas(mod_lf, bg=DARK, highlightthickness=0)
         self._c_mod.grid(row=0, column=0, sticky="nsew")
+        self._c_mod.bind('<ButtonPress-1>',   self._on_mod_press)
+        self._c_mod.bind('<B1-Motion>',        self._on_mod_drag)
+        self._c_mod.bind('<ButtonRelease-1>',  self._on_mod_release)
         self._mod_info = ttk.Label(mod_lf, text="", foreground="#666", font=("Consolas",7))
         self._mod_info.grid(row=1, column=0, sticky="w")
 
@@ -5387,6 +5401,7 @@ class CarModderApp(tk.Tk):
 
         def _update():
             self._tk_mod = tk_img
+            self._mod_disp_scale = thumb.width / max(1, img.width)
             self._c_mod.delete("all")
             self._c_mod.create_image(w // 2, h // 2, image=self._tk_mod, anchor="center")
             self._mod_info.config(
@@ -5627,6 +5642,37 @@ class CarModderApp(tk.Tk):
         for i, d in enumerate(slot.decals):
             self._decal_lb.insert(tk.END,
                 f"  {i+1}. {d.get('name', os.path.basename(d['path']))}")
+
+    # ── Decal canvas drag ─────────────────────────────────────────────────────
+
+    def _on_mod_press(self, event):
+        sel = self._decal_lb.curselection()
+        if not sel or not self._sel or not self._sel.decals:
+            return
+        d = self._sel.decals[sel[0]]
+        self._mod_drag_start  = (event.x, event.y)
+        self._mod_drag_origin = (d.get('x', 0), d.get('y', 0))
+
+    def _on_mod_drag(self, event):
+        if not self._mod_drag_start:
+            return
+        sel = self._decal_lb.curselection()
+        if not sel or not self._sel or not self._sel.decals:
+            self._mod_drag_start = None
+            return
+        scale = self._mod_disp_scale or 1.0
+        new_x = self._mod_drag_origin[0] + int((event.x - self._mod_drag_start[0]) / scale)
+        new_y = self._mod_drag_origin[1] + int((event.y - self._mod_drag_start[1]) / scale)
+        d = self._sel.decals[sel[0]]
+        d['x'] = new_x
+        d['y'] = new_y
+        self._decal_x.set(new_x)
+        self._decal_y.set(new_y)
+        self._sync_decal_props()
+
+    def _on_mod_release(self, event):
+        self._mod_drag_start  = None
+        self._mod_drag_origin = None
 
     def _save_decal_group(self):
         if not self._sel or not self._sel.decals:
